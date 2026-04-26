@@ -9,6 +9,19 @@ const bcrypt = require("bcrypt");
 const sgMail = require("@sendgrid/mail");
 const openai = require("openai");
 const cron = require('node-cron');
+const rateLimit = require("express-rate-limit");
+
+// 20 chatbot calls per hour per authenticated user. Each call hits OpenAI at
+// real cost; without this a stolen JWT can loop and drain the lab's OpenAI
+// budget. Keyed by req._id so it survives shared NAT / school WiFi.
+const chatbotLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req._id || req.ip,
+  message: { error: "Too many chatbot requests. Please try again later." },
+});
 
 const app = express();
 const port = 3001;
@@ -416,8 +429,12 @@ app.post("/send-code", async (req, res) => {
 });
 
 // Add behaviors endpoint
-app.post("/behaviors", async (req, res) => {
+app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
   try {
+    if (String(req.body.user) !== String(req._id)) {
+      return res.status(403).send("Forbidden: cannot write to another user's behaviors.");
+    }
+
     const existingBehavior = await Behavior.findOne({
       user: req.body.user,
       goalType: req.body.goalType,
@@ -534,8 +551,12 @@ app.delete(
 );
 
 // Get behaviors by user, date, and goalType
-app.get("/dailyBehavior", async (req, res) => {
+app.get("/dailyBehavior", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
   try {
+    if (String(req.query.user) !== String(req._id)) {
+      return res.status(403).send("Forbidden: cannot read another user's behaviors.");
+    }
+
     const behaviorToday = await Behavior.find({
       user: req.query.user,
       goalType: req.query.goalType,
@@ -547,8 +568,11 @@ app.get("/dailyBehavior", async (req, res) => {
   }
 });
 
-app.get("/journals-date/v1", async (req, res) => {
+app.get("/journals-date/v1", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
   try {
+    if (String(req.query.userId) !== String(req._id)) {
+      return res.status(403).send("Forbidden: cannot read another user's journal dates.");
+    }
 
     const date = new Date(req.query.date);
 
@@ -629,7 +653,7 @@ const handleSave = async () => {
 };
 
 
-app.post("/chatbot", (req, res) => {
+app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, (req, res) => {
   const prompt = req.body.prompt;
   try {
     openaiInstance.chat.completions
@@ -689,7 +713,7 @@ app.post("/chatbot", (req, res) => {
   }
 });
 
-app.post("/chatbot/screentime", (req, res) => {
+app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, (req, res) => {
   const prompt = req.body.prompt;
   try {
     openaiInstance.chat.completions
