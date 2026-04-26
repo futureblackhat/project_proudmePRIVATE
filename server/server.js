@@ -347,6 +347,17 @@ const User = mongoose.model("User", userSchema);
 const Behavior = mongoose.model("Behavior", behaviorSchema);
 const Goal = mongoose.model("Goal", goalSchema);
 
+// Revoked-JWT blacklist. Logged-out tokens are inserted here (sha256 hash,
+// not the raw token) and looked up by authMiddleware.verifyToken to reject
+// further use. expiresAt is a TTL index — MongoDB auto-deletes entries
+// the moment the underlying JWT would have expired anyway, so the table
+// stays bounded in size (one row per active session at most).
+const revokedTokenSchema = new mongoose.Schema({
+  tokenHash: { type: String, required: true, unique: true, index: true },
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+const RevokedToken = mongoose.model("RevokedToken", revokedTokenSchema);
+
 
 //delete file everyday it passes 
 
@@ -597,6 +608,31 @@ app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, 
   }
 });
 
+
+// Server-side logout. Revokes the JWT by inserting a sha256 of the raw token
+// into the RevokedToken collection with the JWT's own `exp` as expiresAt
+// (so the row auto-cleans via the TTL index when the token would have
+// expired anyway). Subsequent authenticated requests with the same token
+// fail at verifyToken.
+app.post("/logout", authMiddleware.verifyToken, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader.split(" ")[1];
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const decoded = jwt.decode(token);
+    const expiresAt = new Date((decoded.exp || 0) * 1000);
+
+    await RevokedToken.updateOne(
+      { tokenHash },
+      { $setOnInsert: { tokenHash, expiresAt } },
+      { upsert: true }
+    );
+    return res.status(200).send("Logged out");
+  } catch (error) {
+    console.error("Logout error:", error);
+    return res.status(500).send("Internal server error");
+  }
+});
 
 // User endpoint
 app.get("/users", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
