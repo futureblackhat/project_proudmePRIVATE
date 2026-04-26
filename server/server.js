@@ -120,10 +120,17 @@ mongoose
     console.error(err);
   });
 
-// Define user schema and model
+// Define user schema and model.
+//
+// password + verificationCode are `select: false` so they're EXCLUDED from
+// query results by default. Any new route that returns a User document will
+// automatically NOT leak the bcrypt hash or the email verification code.
+// Routes that genuinely need these fields (login: bcrypt.compare; verify:
+// code match) must opt in via `.select('+password')` / `.select('+verificationCode')`.
+// Secure-by-default — adding a new query is safe by accident, not by remembering.
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+  password: { type: String, required: true, select: false },
   name: { type: String, required: true },
   firstName: { type: String, required: true },
   lastName: { type: String, required: true },
@@ -133,7 +140,7 @@ const userSchema = new mongoose.Schema({
   gradeLevel: { type: String, required: true },
   gender: { type: String, required: true },
   isVerifiedEmail: { type: Boolean, default: true },
-  verificationCode: { type: String },
+  verificationCode: { type: String, select: false },
 });
 
 const goalSchema = new mongoose.Schema({
@@ -353,10 +360,11 @@ app.post("/login", loginLimiter, async (req, res) => {
   const password = req.body.password;
 
   try {
-    // Check email and password against database
+    // Check email and password against database. Schema marks password
+    // select:false; explicitly opt in here so bcrypt.compare can run.
     const user = await User.findOne({
       $or: [{ email: email }, { name: email }],
-    });
+    }).select("+password");
 
     if (!user || !bcrypt.compareSync(password, user.password)) {
       // If login fails, return an error response
@@ -440,7 +448,7 @@ app.post("/verify", verifyLimiter, async (req, res) => {
   const { email, code } = req.body;
 
   try {
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email }).select("+verificationCode");
 
     if (!user) {
       return res.status(400).send("User not found");
@@ -465,7 +473,9 @@ app.post("/send-code", sendCodeLimiter, async (req, res) => {
   const { email } = req.body;
 
   try {
-    const user = await User.findOne({ email }) || await User.findOne({name: email});
+    const user =
+      (await User.findOne({ email }).select("+verificationCode")) ||
+      (await User.findOne({ name: email }).select("+verificationCode"));
 
     if (!user) {
       return res.status(400).send("User not found");
