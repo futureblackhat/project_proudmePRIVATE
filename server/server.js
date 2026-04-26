@@ -767,6 +767,54 @@ app.post("/user", async (req, res) => {
   res.status(200).json(user);
 });
 
+// Account deletion endpoint — Apple App Store Guideline 5.1.1(v).
+// Hard-deletes the user document plus every collection that references the user.
+app.delete(
+  "/user/:id",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      if (String(req._id) !== String(req.params.id)) {
+        return res
+          .status(403)
+          .send("Forbidden: cannot delete another user's account.");
+      }
+
+      const userId = req._id;
+
+      // Cascade delete all user-linked collections. Each is wrapped so a
+      // missing/empty collection doesn't block the main user delete.
+      const cascades = [
+        () => Behavior.deleteMany({ user: userId }),
+        () => Goal.deleteMany({ user: userId }),
+        () => BehaviorInputs.deleteMany({ user: userId }),
+        () => GoalInputs.deleteMany({ user: userId }),
+        () => ChatbotResponse.deleteMany({ user: userId }),
+      ];
+      for (const run of cascades) {
+        try {
+          await run();
+        } catch (cascadeErr) {
+          console.error("Cascade delete error:", cascadeErr);
+        }
+      }
+
+      const deleted = await User.findByIdAndDelete(userId);
+      if (!deleted) {
+        return res.status(404).send("User not found.");
+      }
+
+      return res
+        .status(200)
+        .json({ message: "Account and associated data deleted." });
+    } catch (error) {
+      console.error("Account deletion error:", error);
+      return res.status(500).send("Internal server error");
+    }
+  }
+);
+
 // User endpoint
 app.get("/allUsers", async (req, res) => {
   try {
