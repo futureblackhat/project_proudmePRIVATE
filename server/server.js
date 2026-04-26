@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const jwt = require("jsonwebtoken");
 const bodyParser = require("body-parser");
 const mongoose = require("mongoose");
@@ -23,18 +24,75 @@ const chatbotLimiter = rateLimit({
   message: { error: "Too many chatbot requests. Please try again later." },
 });
 
+// Login: 10 attempts / 15 min / IP. Blocks credential stuffing without
+// punishing legitimate typo-then-retry. Keyed by IP because no token exists
+// at this point.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please try again later." },
+});
+
+// Verify: 5 attempts / 15 min / IP. Tighter than login because the
+// verification code is only 6 digits — must bound brute-force window.
+const verifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many verification attempts. Please try again later." },
+});
+
+// Send-code: 3 / 15 min / IP. Stops attacker (or buggy client retry loop)
+// from burning the SendGrid quota and spamming an inbox.
+const sendCodeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many code requests. Please wait before trying again." },
+});
+
 const app = express();
 const port = 3001;
 
 const uri = process.env.REACT_APP_MONGODB_URI;
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-app.use(cors());
+
+// helmet first so its security headers (X-Frame-Options, X-Content-Type-Options,
+// Strict-Transport-Security, etc.) are applied to every response, including
+// errors emitted by middleware below.
+app.use(helmet());
+
+// Browser-callable origins. Native iOS/Android Flutter apps don't trigger
+// CORS at all (no browser), so the only legitimate browser callers are local
+// dev (Flutter web on Chrome) and any future hosted web frontend. Anything
+// else gets rejected — closes the browser-side CSRF/embed-our-API-in-a-rogue-
+// site risk class. Requests with no Origin header (curl, native mobile,
+// server-to-server) pass through.
+const allowedOriginPatterns = [
+  /^http:\/\/localhost(:\d+)?$/,
+  /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+];
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      const ok = allowedOriginPatterns.some((re) => re.test(origin));
+      return cb(ok ? null : new Error("Origin not allowed"), ok);
+    },
+    credentials: false,
+  })
+);
+
+// 1 MB cap on every request body. Without this an attacker can send a
+// 100 MB JSON body and OOM the dyno; legitimate journal payloads are
+// well under 10 KB.
+app.use(bodyParser.urlencoded({ extended: false, limit: "1mb" }));
+app.use(bodyParser.json({ limit: "1mb" }));
 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-
-app.use(express.json());
 
 
 // Connect to MongoDB
@@ -278,7 +336,7 @@ cron.schedule('0 0 * * *', async () => {
 });
 
 // Login endpoint
-app.post("/login", async (req, res) => {
+app.post("/login", loginLimiter, async (req, res) => {
   const email = req.body.email;
   const password = req.body.password;
 
@@ -366,7 +424,7 @@ app.post("/register", async (req, res) => {
 });
 
 // Email verification endpoint
-app.post("/verify", async (req, res) => {
+app.post("/verify", verifyLimiter, async (req, res) => {
   const { email, code } = req.body;
 
   try {
@@ -391,7 +449,7 @@ app.post("/verify", async (req, res) => {
 });
 
 // Resend verification email endpoint
-app.post("/send-code", async (req, res) => {
+app.post("/send-code", sendCodeLimiter, async (req, res) => {
   const { email } = req.body;
 
   try {
