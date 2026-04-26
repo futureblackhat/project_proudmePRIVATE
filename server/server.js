@@ -581,26 +581,6 @@ app.get("/journals-date/v1", async (req, res) => {
   }
 });
 
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-app.post("/send-email", (req, res) => {
-  const { to, subject, text } = req.body;
-  const msg = {
-    to,
-    from: "pklab@projectproudme.com",
-    subject,
-    text,
-  };
-
-  sgMail
-    .send(msg)
-    .then(() => res.send("Email sent successfully"))
-    .catch((error) => {
-      console.error(error);
-      res.status(500).send("Failed to send email");
-    });
-});
-
-
 const openaiInstance = new openai({ apiKey: process.env.OPEN_AI_API_KEY });
 const handleSave = async () => {
   // Log current selected items, goal inputs, and behavior inputs
