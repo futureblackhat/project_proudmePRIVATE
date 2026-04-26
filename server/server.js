@@ -124,7 +124,10 @@ const sendCodeLimiter = rateLimit({
 });
 
 const app = express();
-const port = 3001;
+// Render injects PORT into the environment; fall back to 3001 for local dev.
+// Hard-coding 3001 used to mean Render had to bridge port 3001 → its public
+// port via its own config; reading process.env.PORT lets the platform pick.
+const port = process.env.PORT || 3001;
 
 // Chain in front of the app is: client → Cloudflare → Render LB → app
 // (confirmed by `Server: cloudflare` + `CF-RAY` response headers). That's
@@ -175,7 +178,9 @@ app.use(bodyParser.json({ limit: "1mb" }));
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 
-// Connect to MongoDB
+// Connect to MongoDB. Connection failure must be FATAL — without it the
+// server starts but every route 500s. Better to crash the dyno so Render
+// marks the deploy failed and falls back to the previous build.
 mongoose
   .connect(uri, {
     useNewUrlParser: true,
@@ -185,7 +190,8 @@ mongoose
     console.log("Connected to MongoDB");
   })
   .catch((err) => {
-    console.error(err);
+    console.error("MongoDB connection failed:", err);
+    process.exit(1);
   });
 
 // Define user schema and model.
@@ -196,6 +202,8 @@ mongoose
 // Routes that genuinely need these fields (login: bcrypt.compare; verify:
 // code match) must opt in via `.select('+password')` / `.select('+verificationCode')`.
 // Secure-by-default — adding a new query is safe by accident, not by remembering.
+//
+// MUST stay in sync with `server/models/User.js` (used by cron.js). See M24.
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true, select: false },
@@ -253,6 +261,8 @@ const goalSchema = new mongoose.Schema({
   },
 });
 
+// Behavior schema. MUST stay in sync with `server/models/Behavior.js` (used
+// by cron.js). See M24.
 const behaviorSchema = new mongoose.Schema({
   user: {
     type: mongoose.Schema.Types.ObjectId,
@@ -417,17 +427,15 @@ const RevokedToken = mongoose.model("RevokedToken", revokedTokenSchema);
 
 //delete file everyday it passes 
 
+// Daily data reset job. Wipes SelectedItems at midnight UTC. Logging the
+// deletion count gives an audit trail (M27): if this job ever silently
+// nukes a non-empty collection it should be visible in Render logs.
 cron.schedule('0 0 * * *', async () => {
   console.log('Running daily data reset job');
 
   try {
-    // Clear the collections
-    await SelectedItems.deleteMany({});
-    // await GoalInputs.deleteMany({});
-    // await BehaviorInputs.deleteMany({});
-    // await ChatbotResponse.deleteMany({});
-
-    console.log('Data reset successfully');
+    const result = await SelectedItems.deleteMany({});
+    console.log(`Data reset successfully — deleted ${result.deletedCount} SelectedItems doc(s)`);
   } catch (error) {
     console.error('Error resetting data:', error);
   }
@@ -453,7 +461,11 @@ app.post("/login", loginLimiter, async (req, res) => {
 
     // If login is successful, return a success response
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
-    console.log(`User with email ${email} logged in successfully.`)
+    // Logging the email here was a COPPA data-minimization gap: server logs
+    // (Render dashboard, downloaded log archives, third-party log shippers)
+    // would carry user emails. Log the user id instead — non-PII, sufficient
+    // for tracing.
+    console.log(`User ${user._id} logged in successfully.`);
     res.send(token);
   } catch (error) {
     console.error(error);
@@ -676,7 +688,12 @@ app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, 
       res.status(201).json(savedBehavior);
     }
   } catch (err) {
-    res.status(400).json({ message: err.message });
+    // Don't leak err.message to the client — Mongoose error strings include
+    // index names, schema field names, and duplicate-key details that map
+    // straight to internal structure. Log on the server, return a generic
+    // message to the caller.
+    console.error(err);
+    res.status(400).json({ message: "Invalid request." });
   }
 });
 
@@ -788,7 +805,12 @@ app.get("/dailyBehavior", authMiddleware.verifyToken, authMiddleware.attachUserI
     });
     res.status(200).json(behaviorToday);
   } catch (err) {
-    res.status(400).json({ message: err.message });
+    // Don't leak err.message to the client — Mongoose error strings include
+    // index names, schema field names, and duplicate-key details that map
+    // straight to internal structure. Log on the server, return a generic
+    // message to the caller.
+    console.error(err);
+    res.status(400).json({ message: "Invalid request." });
   }
 });
 
@@ -831,7 +853,12 @@ app.get("/journals-date/v1", authMiddleware.verifyToken, authMiddleware.attachUs
 
     res.status(200).json(Array.from(entryDatesForLast30Days));
   } catch (err) {
-    res.status(400).json({ message: err.message });
+    // Don't leak err.message to the client — Mongoose error strings include
+    // index names, schema field names, and duplicate-key details that map
+    // straight to internal structure. Log on the server, return a generic
+    // message to the caller.
+    console.error(err);
+    res.status(400).json({ message: "Invalid request." });
   }
 });
 
@@ -1004,6 +1031,14 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
     console.error("Chatbot error: ", error);
     res.status(500).json({ error: "Chatbot request failed" });
   }
+});
+
+// Liveness probe. No auth, no DB roundtrip — just confirms the process is
+// running and responding. Hook this into Render's health checks and any
+// external uptime monitor (UptimeRobot, etc.) so the moment the dyno goes
+// down we get paged instead of finding out from a user.
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
 app.listen(port, () => {
