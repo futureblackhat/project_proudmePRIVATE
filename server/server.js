@@ -299,6 +299,19 @@ app.post("/register", async (req, res) => {
     return res.status(400).send("Passwords do not match");
   }
 
+  // Explicit uniqueness check so we return a clean 409 instead of letting
+  // Mongoose throw a generic 500 on the unique-index violation.
+  try {
+    const existing = await User.findOne({ $or: [{ email }, { name }] });
+    if (existing) {
+      const field = existing.email === email ? "email" : "name";
+      return res.status(409).json({ field, message: `This ${field} is already registered.` });
+    }
+  } catch (lookupErr) {
+    console.error("Register uniqueness check failed:", lookupErr);
+    return res.status(500).send("Internal server error");
+  }
+
   const salt = bcrypt.genSaltSync(10);
   const hashedPassword = bcrypt.hashSync(password, salt);
   const verificationCode = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit code
@@ -460,39 +473,6 @@ app.post("/behaviors", async (req, res) => {
   }
 });
 
-
-// Signup endpoint
-app.post("/signup", async (req, res) => {
-  const { email, password, confirmPassword, name, firstName, lastName, schoolName, birthMonth, birthYear, gradeLevel, gender } = req.body;
-
-  if (password !== confirmPassword) {
-    return res.status(400).send("Passwords do not match");
-  }
-
-  const salt = bcrypt.genSaltSync(10);
-  const hashedPassword = bcrypt.hashSync(password, salt);
-
-  try {
-    const newUser = new User({
-      email,
-      password: hashedPassword,
-      name,
-      firstName,
-      lastName,
-      schoolName,
-      birthMonth,
-      birthYear,
-      gradeLevel,
-      gender,
-    });
-    await newUser.save();
-    console.log(`User with email ${email} registered successfully.`)
-    res.status(200).send(newUser);
-  } catch (error) {
-    res.status(500).send("Internal server error");
-    console.error(error);
-  }
-});
 
 // User endpoint
 app.get("/users", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
