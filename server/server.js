@@ -282,7 +282,7 @@ app.post("/login", async (req, res) => {
     }
 
     // If login is successful, return a success response
-    const token = jwt.sign({ userId: user._id }, "secret_key");
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     console.log(`User with email ${email} logged in successfully.`)
     res.send(token);
   } catch (error) {
