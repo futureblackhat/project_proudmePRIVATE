@@ -11,6 +11,18 @@ const sgMail = require("@sendgrid/mail");
 const openai = require("openai");
 const cron = require('node-cron');
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+
+// Password policy: min 8 chars, at least one letter, at least one digit.
+// Enforced server-side (authoritative) and mirrored client-side (UX).
+const PASSWORD_POLICY = /^(?=.*[A-Za-z])(?=.*\d).{8,}$/;
+
+// Generate a 6-digit numeric verification code via crypto.randomInt
+// (CSPRNG). Math.random() is not cryptographically random — replacing it
+// closes a brute-force-via-prediction angle on the email verification flow.
+function generateVerificationCode() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
 
 // 20 chatbot calls per hour per authenticated user. Each call hits OpenAI at
 // real cost; without this a stolen JWT can loop and drain the lab's OpenAI
@@ -390,6 +402,13 @@ app.post("/register", async (req, res) => {
     return res.status(400).send("Passwords do not match");
   }
 
+  if (!PASSWORD_POLICY.test(password)) {
+    return res.status(400).json({
+      field: "password",
+      message: "Password must be at least 8 characters and include a letter and a digit.",
+    });
+  }
+
   // Explicit uniqueness check so we return a clean 409 instead of letting
   // Mongoose throw a generic 500 on the unique-index violation.
   try {
@@ -405,7 +424,11 @@ app.post("/register", async (req, res) => {
 
   const salt = bcrypt.genSaltSync(10);
   const hashedPassword = bcrypt.hashSync(password, salt);
-  const verificationCode = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit code
+  // Plaintext code goes in the email; the bcrypt hash is what we persist.
+  // Even with select:false on the schema, anyone with read access to the DB
+  // (research staff with snapshots, leaked backups, etc.) only sees a hash.
+  const verificationCode = generateVerificationCode();
+  const hashedVerificationCode = bcrypt.hashSync(verificationCode, salt);
 
   try {
     const newUser = new User({
@@ -420,7 +443,7 @@ app.post("/register", async (req, res) => {
       gradeLevel,
       gender,
       isVerifiedEmail: true,
-      verificationCode
+      verificationCode: hashedVerificationCode,
     });
     await newUser.save();
 
@@ -454,7 +477,10 @@ app.post("/verify", verifyLimiter, async (req, res) => {
       return res.status(400).send("User not found");
     }
 
-    if (user.verificationCode === code) {
+    // verificationCode is a bcrypt hash now (H9). Compare in constant time.
+    const codeMatches =
+      user.verificationCode && bcrypt.compareSync(code, user.verificationCode);
+    if (codeMatches) {
       user.isVerifiedEmail = true;
       user.verificationCode = null; // Clear the verification code
       await user.save();
@@ -485,8 +511,9 @@ app.post("/send-code", sendCodeLimiter, async (req, res) => {
       return res.status(400).send("Email is already verified");
     }
 
-    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-    user.verificationCode = verificationCode;
+    const verificationCode = generateVerificationCode();
+    const salt = bcrypt.genSaltSync(10);
+    user.verificationCode = bcrypt.hashSync(verificationCode, salt);
     await user.save();
 
     const msg = {
