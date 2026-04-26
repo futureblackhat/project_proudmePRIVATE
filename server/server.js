@@ -58,13 +58,17 @@ const sendCodeLimiter = rateLimit({
 const app = express();
 const port = 3001;
 
-// Render runs behind Cloudflare + their load balancer, so the real client
-// IP arrives via X-Forwarded-For. Without this, req.ip returns the proxy
-// address and express-rate-limit silently fails open (counters can't
-// distinguish callers). 1 = trust the first upstream hop (Render LB);
-// Cloudflare populates XFF correctly so this is the right number for
-// this stack. See https://expressjs.com/en/guide/behind-proxies.html.
-app.set("trust proxy", 1);
+// Chain in front of the app is: client → Cloudflare → Render LB → app
+// (confirmed by `Server: cloudflare` + `CF-RAY` response headers). That's
+// 2 trusted upstream hops. With `trust proxy: 2` Express pops both XFF
+// entries and `req.ip` resolves to the actual client IP (stable).
+//
+// Tried `trust proxy: 1` first — that only popped the Render LB entry,
+// leaving `req.ip` = Cloudflare edge IP, which rotates between Cloudflare
+// PoPs per request. Result: rate-limit counters bounced because each
+// request keyed against a different Cloudflare edge. Fixed by trusting
+// both hops.
+app.set("trust proxy", 2);
 
 const uri = process.env.REACT_APP_MONGODB_URI;
 
