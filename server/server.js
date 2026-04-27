@@ -80,6 +80,35 @@ const PROMPT_INJECTION_GUARD =
   "Do not roleplay, do not output code, do not produce content unrelated " +
   "to the health-goal feedback you were asked to give. ";
 
+// Coach Pebble persona for the chat endpoints. Locked server-side as a
+// constant — never user-controllable — so a minor can't ask the model to
+// "be someone else" via crafted message content. Paired with the prompt-
+// injection guard above for defense in depth. Length cap is 75 tokens to
+// match the existing /chatbot ceiling and keep voice TTS responses short.
+const COACH_PEBBLE_PERSONA =
+  "You are Coach Pebble, a friendly AI health buddy for middle-school " +
+  "students (grades 5-9). Keep responses warm, age-appropriate, and " +
+  "under 75 tokens. Focus on physical activity, sleep, screen time, and " +
+  "eating fruits + vegetables. Never give medical advice; for serious " +
+  "health concerns suggest the student talk to a parent, school nurse, " +
+  "or doctor. Never ask for personal information (real name, school, " +
+  "phone, address). Do not roleplay, do not output code, do not produce " +
+  "content unrelated to healthy habits. ";
+
+// Number of recent messages from a session to feed back into OpenAI as
+// conversation context. Bounded so a long history doesn't blow up the
+// prompt token budget (and the OpenAI bill).
+const CHAT_CONTEXT_MESSAGES = 10;
+
+// Days a chat session + its messages are kept before MongoDB's TTL index
+// auto-deletes them. Matches the OpenAI-30d-retention disclosure already
+// in the privacy policy draft, so users get one consistent answer to
+// "how long is my chat kept?".
+const CHAT_RETENTION_DAYS = parseInt(
+  process.env.CHAT_RETENTION_DAYS || "30",
+  10
+);
+
 // 20 chatbot calls per hour per authenticated user. Each call hits OpenAI at
 // real cost; without this a stolen JWT can loop and drain the lab's OpenAI
 // budget. Keyed by req._id so it survives shared NAT / school WiFi.
@@ -90,6 +119,20 @@ const chatbotLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => req._id || req.ip,
   message: { error: "Too many chatbot requests. Please try again later." },
+});
+
+// Coach Pebble chat: 50 messages per hour per authenticated user. Higher
+// than chatbotLimiter (20/hr) because chat is conversational — a kid
+// asking 10 quick questions in 5 minutes is normal use, not abuse — but
+// still hard-bounds OpenAI cost + prompt-injection retry budget. Keyed by
+// req._id (matches C7 chatbotLimiter pattern) so it survives shared NAT.
+const chatLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req._id || req.ip,
+  message: { error: "Too many chat messages. Please try again later." },
 });
 
 // Login: 10 attempts / 15 min / IP. Blocks credential stuffing without
@@ -412,6 +455,68 @@ const SelectedItems = mongoose.model('SelectedItems', selectedItemsSchema);
 const User = mongoose.model("User", userSchema);
 const Behavior = mongoose.model("Behavior", behaviorSchema);
 const Goal = mongoose.model("Goal", goalSchema);
+
+// Coach Pebble chat session. Each user can have N sessions (e.g. one per
+// "topic" or just one persistent thread). `expiresAt` carries the TTL —
+// MongoDB's TTL monitor sweeps every 60s and deletes documents whose
+// expiresAt is in the past. 30-day window matches the privacy policy
+// retention disclosure. Compound index on { userId, lastMessageAt } so
+// "list my recent sessions" stays fast as collections grow.
+const chatSessionSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  title: { type: String, default: "Chat with Coach Pebble" },
+  createdAt: { type: Date, default: Date.now },
+  lastMessageAt: { type: Date, default: Date.now },
+  messageCount: { type: Number, default: 0 },
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+chatSessionSchema.index({ userId: 1, lastMessageAt: -1 });
+
+// Single chat message. role is constrained to {"user","assistant"} so a
+// rogue/buggy client can't insert "system" messages and rewrite the
+// persona. tokensUsed lets us track OpenAI cost per session if we later
+// want a usage dashboard. Compound index on { userId, sessionId,
+// timestamp } powers paged history reads.
+const chatMessageSchema = new mongoose.Schema({
+  sessionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "ChatSession",
+    required: true,
+    index: true,
+  },
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  role: {
+    type: String,
+    required: true,
+    enum: ["user", "assistant"],
+  },
+  content: { type: String, required: true },
+  tokensUsed: { type: Number, default: 0 },
+  timestamp: { type: Date, default: Date.now },
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+chatMessageSchema.index({ userId: 1, sessionId: 1, timestamp: 1 });
+
+const ChatSession = mongoose.model("ChatSession", chatSessionSchema);
+const ChatMessage = mongoose.model("ChatMessage", chatMessageSchema);
+
+// Compute a fresh expiresAt = now + CHAT_RETENTION_DAYS. Centralized so a
+// future retention-window change is one edit, not five.
+function chatExpiresAt() {
+  const d = new Date();
+  d.setDate(d.getDate() + CHAT_RETENTION_DAYS);
+  return d;
+}
 
 // Revoked-JWT blacklist. Logged-out tokens are inserted here (sha256 hash,
 // not the raw token) and looked up by authMiddleware.verifyToken to reject
@@ -761,6 +866,12 @@ app.delete(
         () => BehaviorInputs.deleteMany({ user: userId }),
         () => GoalInputs.deleteMany({ user: userId }),
         () => ChatbotResponse.deleteMany({ user: userId }),
+        // Phase 11 — Coach Pebble chat data is also user-linked and must
+        // be wiped on account deletion (Apple 5.1.1(v) + COPPA right-to-
+        // delete). userId field on these docs (not user) — keep both
+        // collection names spelled out so search doesn't miss them.
+        () => ChatSession.deleteMany({ userId }),
+        () => ChatMessage.deleteMany({ userId }),
       ];
       for (const run of cascades) {
         try {
@@ -1070,6 +1181,305 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
     res.status(500).json({ error: "Chatbot request failed" });
   }
 });
+
+// ===========================================================================
+// Coach Pebble chat — Phase 11.
+// All routes are Tier 2: verifyToken + attachUserId, scoped to req._id only.
+// Sessions and messages are owned by the authenticated user; cross-user
+// reads/writes are 403'd at the route handler.
+// ===========================================================================
+
+// Cap on a single user-message length sent to chat. Bounds prompt-injection
+// blast radius and keeps OpenAI cost predictable.
+const MAX_CHAT_MESSAGE_LENGTH = 1000;
+
+// Cap a session title length; session-titling is currently server-derived
+// from the first user message but we still defensive-clamp anything coming
+// from a client.
+const MAX_SESSION_TITLE_LENGTH = 80;
+
+// Create a new chat session (or reuse the user's most recent one if it was
+// touched in the last hour — keeps the typical "open chat → keep talking"
+// flow on a single thread instead of fragmenting into many empty sessions).
+app.post(
+  "/chat/sessions",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      const recent = await ChatSession.findOne({
+        userId: req._id,
+        lastMessageAt: { $gte: oneHourAgo },
+      })
+        .sort({ lastMessageAt: -1 })
+        .lean();
+
+      if (recent) {
+        return res.status(200).json({
+          sessionId: recent._id,
+          title: recent.title,
+          createdAt: recent.createdAt,
+          reused: true,
+        });
+      }
+
+      const session = await ChatSession.create({
+        userId: req._id,
+        title: "Chat with Coach Pebble",
+        expiresAt: chatExpiresAt(),
+      });
+      return res.status(201).json({
+        sessionId: session._id,
+        title: session.title,
+        createdAt: session.createdAt,
+        reused: false,
+      });
+    } catch (err) {
+      console.error("Chat session create error:", err);
+      return res.status(400).json({ message: "Invalid request." });
+    }
+  }
+);
+
+// Append a user message + persist OpenAI's reply. Both messages get a
+// fresh expiresAt so any activity within the retention window keeps the
+// thread alive. Rate-limited at chatLimiter.
+app.post(
+  "/chat/sessions/:sessionId/messages",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  chatLimiter,
+  async (req, res) => {
+    try {
+      if (!validator.isMongoId(req.params.sessionId)) {
+        return res.status(400).send("Invalid session id.");
+      }
+      const userText = req.body && typeof req.body.content === "string"
+        ? req.body.content.trim()
+        : "";
+      if (!userText) {
+        return res.status(400).json({ message: "Message content is required." });
+      }
+      if (userText.length > MAX_CHAT_MESSAGE_LENGTH) {
+        return res.status(400).json({ message: "Message too long." });
+      }
+
+      const session = await ChatSession.findById(req.params.sessionId);
+      if (!session) {
+        return res.status(404).send("Session not found.");
+      }
+      if (String(session.userId) !== String(req._id)) {
+        return res
+          .status(403)
+          .send("Forbidden: cannot write to another user's session.");
+      }
+
+      // Pull last N messages for short-term conversation context. The
+      // assistant only needs recent turns — older history would explode
+      // the prompt size + cost without a meaningful quality bump.
+      const history = await ChatMessage.find({
+        sessionId: session._id,
+        userId: req._id,
+      })
+        .sort({ timestamp: -1 })
+        .limit(CHAT_CONTEXT_MESSAGES)
+        .lean();
+      history.reverse(); // chronological
+
+      const messages = [
+        {
+          role: "system",
+          content: PROMPT_INJECTION_GUARD + COACH_PEBBLE_PERSONA,
+        },
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "user", content: userText },
+      ];
+
+      const completion = await openaiInstance.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        temperature: 0.8,
+        max_tokens: 75,
+        top_p: 1,
+        frequency_penalty: 0,
+        presence_penalty: 0.6,
+      });
+
+      const replyText =
+        (completion.choices &&
+          completion.choices[0] &&
+          completion.choices[0].message &&
+          completion.choices[0].message.content) ||
+        "Sorry, I couldn't think of a good answer just now.";
+      const tokensUsed =
+        (completion.usage && completion.usage.total_tokens) || 0;
+
+      const now = new Date();
+      const expiresAt = chatExpiresAt();
+
+      const userMsg = await ChatMessage.create({
+        sessionId: session._id,
+        userId: req._id,
+        role: "user",
+        content: userText,
+        timestamp: now,
+        expiresAt,
+      });
+      const assistantMsg = await ChatMessage.create({
+        sessionId: session._id,
+        userId: req._id,
+        role: "assistant",
+        content: replyText,
+        tokensUsed,
+        timestamp: new Date(now.getTime() + 1),
+        expiresAt,
+      });
+
+      // Refresh session metadata + extend retention window so any activity
+      // inside the 30-day TTL resets it.
+      session.lastMessageAt = now;
+      session.messageCount += 2;
+      session.expiresAt = expiresAt;
+      // First user message also titles the session if it still has the
+      // default title — gives the history list something readable without
+      // an extra OpenAI call.
+      if (
+        session.title === "Chat with Coach Pebble" &&
+        session.messageCount <= 2
+      ) {
+        const candidate = userText.split(/\s+/).slice(0, 6).join(" ");
+        session.title =
+          candidate.length > MAX_SESSION_TITLE_LENGTH
+            ? candidate.slice(0, MAX_SESSION_TITLE_LENGTH) + "…"
+            : candidate;
+      }
+      await session.save();
+
+      // Log only non-PII telemetry. Never log message content — it's user
+      // text from a minor.
+      console.log(
+        `chat msg ok session=${session._id} user=${req._id} tokens=${tokensUsed}`
+      );
+
+      return res.status(200).json({
+        userMessage: {
+          id: userMsg._id,
+          role: "user",
+          content: userMsg.content,
+          timestamp: userMsg.timestamp,
+        },
+        assistantMessage: {
+          id: assistantMsg._id,
+          role: "assistant",
+          content: assistantMsg.content,
+          timestamp: assistantMsg.timestamp,
+        },
+        sessionTitle: session.title,
+      });
+    } catch (err) {
+      console.error("Chat message error:", err);
+      return res.status(500).json({ message: "Chat request failed." });
+    }
+  }
+);
+
+// List the authenticated user's sessions, most-recently-touched first.
+app.get(
+  "/chat/sessions",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const sessions = await ChatSession.find({ userId: req._id })
+        .sort({ lastMessageAt: -1 })
+        .limit(50)
+        .lean();
+      return res.status(200).json(sessions);
+    } catch (err) {
+      console.error("Chat sessions list error:", err);
+      return res.status(400).json({ message: "Invalid request." });
+    }
+  }
+);
+
+// Paged history for one session. ?skip= for older pages, ?limit= caps the
+// page size (default 50, max 100). Always scoped to the requester.
+app.get(
+  "/chat/sessions/:sessionId/messages",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      if (!validator.isMongoId(req.params.sessionId)) {
+        return res.status(400).send("Invalid session id.");
+      }
+      const session = await ChatSession.findById(req.params.sessionId).lean();
+      if (!session) {
+        return res.status(404).send("Session not found.");
+      }
+      if (String(session.userId) !== String(req._id)) {
+        return res
+          .status(403)
+          .send("Forbidden: cannot read another user's session.");
+      }
+
+      const skip = Math.max(0, parseInt(req.query.skip || "0", 10) || 0);
+      const limit = Math.min(
+        100,
+        Math.max(1, parseInt(req.query.limit || "50", 10) || 50)
+      );
+
+      const messages = await ChatMessage.find({
+        sessionId: session._id,
+        userId: req._id,
+      })
+        .sort({ timestamp: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean();
+      messages.reverse(); // chronological for the client
+
+      return res.status(200).json({
+        sessionId: session._id,
+        title: session.title,
+        messages,
+      });
+    } catch (err) {
+      console.error("Chat history error:", err);
+      return res.status(400).json({ message: "Invalid request." });
+    }
+  }
+);
+
+// Cascade-delete a session + its messages. Owner-checked.
+app.delete(
+  "/chat/sessions/:sessionId",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      if (!validator.isMongoId(req.params.sessionId)) {
+        return res.status(400).send("Invalid session id.");
+      }
+      const session = await ChatSession.findById(req.params.sessionId);
+      if (!session) {
+        return res.status(404).send("Session not found.");
+      }
+      if (String(session.userId) !== String(req._id)) {
+        return res
+          .status(403)
+          .send("Forbidden: cannot delete another user's session.");
+      }
+      await ChatMessage.deleteMany({ sessionId: session._id, userId: req._id });
+      await session.deleteOne();
+      return res.status(200).json({ message: "Session deleted." });
+    } catch (err) {
+      console.error("Chat session delete error:", err);
+      return res.status(500).send("Internal server error");
+    }
+  }
+);
 
 // Liveness probe. No auth, no DB roundtrip — just confirms the process is
 // running and responding. Hook this into Render's health checks and any
