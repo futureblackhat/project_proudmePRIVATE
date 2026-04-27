@@ -1299,6 +1299,16 @@ app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, ch
     .then((response) => {
       const chat_reply = response.choices[0].message.content;
       res.json({ chat_reply });
+    })
+    // Without this .catch(), an OpenAI rejection (key exhausted, network
+    // blip, rate limit, etc.) becomes an unhandled promise rejection and
+    // crashes the Node process — Render then restarts the dyno and clients
+    // see 502s in the meantime. Convert to a clean 500 so the dyno stays up.
+    .catch((err) => {
+      console.error("Chatbot OpenAI error: ", err && err.message ? err.message : err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Chatbot request failed" });
+      }
     });
   } catch (error) {
     console.error("Chatbot error: ", error);
@@ -1358,6 +1368,14 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
     .then((response) => {
       const chat_reply = response.choices[0].message.content;
       res.json({ chat_reply });
+    })
+    // Same unhandled-rejection guard as /chatbot above — without this,
+    // OpenAI failure here crashes the dyno.
+    .catch((err) => {
+      console.error("Chatbot screentime OpenAI error: ", err && err.message ? err.message : err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Chatbot request failed" });
+      }
     });
   } catch (error) {
     console.error("Chatbot error: ", error);
@@ -1789,6 +1807,23 @@ app.delete(
 // down we get paged instead of finding out from a user.
 app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
+});
+
+// Process-level safety net. If a future code path drops a rejected promise
+// (the way /chatbot did before its .catch was added), we'd rather log + keep
+// serving than crash the dyno and 502 every in-flight request. Node 15+
+// default behavior crashes on unhandledRejection — opt out of that.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "Unhandled promise rejection (NOT crashing):",
+    reason && reason.stack ? reason.stack : reason
+  );
+});
+process.on("uncaughtException", (err) => {
+  console.error(
+    "Uncaught exception (NOT crashing):",
+    err && err.stack ? err.stack : err
+  );
 });
 
 app.listen(port, () => {
