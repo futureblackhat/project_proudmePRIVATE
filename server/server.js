@@ -327,7 +327,13 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
       const ok = allowedOriginPatterns.some((re) => re.test(origin));
-      return cb(ok ? null : new Error("Origin not allowed"), ok);
+      // Pass `false` (not an Error) for disallowed origins so the cors
+      // middleware responds cleanly — preflight gets 204 with no
+      // Access-Control-Allow-Origin header, browser blocks the actual
+      // request itself. Throwing an Error here previously caused
+      // Express's default error handler to return 500, which is sloppy
+      // even though browsers still block.
+      return cb(null, ok);
     },
     credentials: false,
   })
