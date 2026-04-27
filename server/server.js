@@ -1237,6 +1237,94 @@ app.get(
   }
 );
 
+// F7 — last-7-days summary for the "Show my recent goals" chat quick-prompt.
+// Returns a small per-goalType aggregate the mobile client can format into a
+// chat seed, so Coach Pebble can give *informed* feedback based on real
+// behavior data rather than generic encouragement. PI authorized on
+// 2026-04-27 alongside the other Phase 13.7 + F4 work.
+//
+// Tier 2: verifyToken + attachUserId, scoped to req._id only.
+app.get(
+  "/behaviors/recent-summary",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - 7);
+
+      const docs = await Behavior.find({
+        user: req._id,
+        // Tolerate legacy rows without dateToday — they get included
+        // (caller can still cap by length below).
+        $or: [
+          { dateToday: { $gte: cutoff } },
+          { dateToday: { $exists: false } },
+        ],
+      })
+        .select("date dateToday goalType behaviorValue goalValue goalStatus mood")
+        .sort({ dateToday: -1 })
+        .limit(50)
+        .lean();
+
+      // Group by goalType and compute simple aggregates the chatbot can
+      // reason about. No PII; no reflection text.
+      const byType = {};
+      for (const d of docs) {
+        const type = d.goalType || "other";
+        if (!byType[type]) {
+          byType[type] = {
+            goalType: type,
+            entries: 0,
+            metGoal: 0,
+            avgBehaviorValue: 0,
+            sumBehaviorValue: 0,
+            avgGoalValue: 0,
+            sumGoalValue: 0,
+            recentMoods: [],
+          };
+        }
+        const t = byType[type];
+        t.entries += 1;
+        if (typeof d.behaviorValue === "number") {
+          t.sumBehaviorValue += d.behaviorValue;
+        }
+        if (typeof d.goalValue === "number") {
+          t.sumGoalValue += d.goalValue;
+        }
+        if (d.goalStatus === "Met" || d.goalStatus === "met") {
+          t.metGoal += 1;
+        }
+        if (d.mood) {
+          t.recentMoods.push(d.mood);
+        }
+      }
+      for (const t of Object.values(byType)) {
+        t.avgBehaviorValue = t.entries > 0
+          ? Math.round((t.sumBehaviorValue / t.entries) * 10) / 10
+          : 0;
+        t.avgGoalValue = t.entries > 0
+          ? Math.round((t.sumGoalValue / t.entries) * 10) / 10
+          : 0;
+        delete t.sumBehaviorValue;
+        delete t.sumGoalValue;
+      }
+
+      res.status(200).json({
+        windowDays: 7,
+        totals: {
+          entries: docs.length,
+          distinctGoalTypes: Object.keys(byType).length,
+        },
+        byGoalType: Object.values(byType),
+      });
+    } catch (err) {
+      console.error("Recent-summary error:", err);
+      res.status(400).json({ message: "Invalid request." });
+    }
+  }
+);
+
 app.get("/journals-date/v1", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
   try {
     if (
