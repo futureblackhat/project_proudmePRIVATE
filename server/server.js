@@ -1292,7 +1292,15 @@ app.get(
         if (typeof d.goalValue === "number") {
           t.sumGoalValue += d.goalValue;
         }
-        if (d.goalStatus === "Met" || d.goalStatus === "met") {
+        // goalStatus is heterogeneous: helpers.dart sends a boolean, the
+        // legacy seed/scripts sometimes write the string "true"/"Met". Be
+        // permissive — accept any truthy representation as "goal met".
+        if (
+          d.goalStatus === true ||
+          d.goalStatus === "Met" ||
+          d.goalStatus === "met" ||
+          d.goalStatus === "true"
+        ) {
           t.metGoal += 1;
         }
         if (d.mood) {
