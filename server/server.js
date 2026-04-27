@@ -814,6 +814,44 @@ app.get("/dailyBehavior", authMiddleware.verifyToken, authMiddleware.attachUserI
   }
 });
 
+// Surfaces the logged-in user's reflection text for the v1 Profile →
+// Saved Reflections screen. Tier 2: verifyToken + attachUserId. Reads
+// req._id only — no req.body.user / req.query.user — so there is no IDOR
+// surface to misuse. Limited to the most recent 200 entries (defensive
+// upper bound; a chatty student over a year still fits comfortably).
+app.get(
+  "/behaviors/reflections",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - 30);
+
+      const docs = await Behavior.find({
+        user: req._id,
+        reflection: { $exists: true, $ne: "" },
+        $or: [
+          { dateToday: { $gte: cutoff } },
+          { dateToday: { $exists: false } },
+        ],
+      })
+        .select("date dateToday goalType reflection feedback")
+        .sort({ dateToday: -1 })
+        .limit(200)
+        .lean();
+
+      res.status(200).json(docs);
+    } catch (err) {
+      // Mongoose error strings can leak schema/index details — log on the
+      // server, return a generic message to the caller (matches the rest
+      // of the routes in this file).
+      console.error("Reflections fetch error:", err);
+      res.status(400).json({ message: "Invalid request." });
+    }
+  }
+);
+
 app.get("/journals-date/v1", authMiddleware.verifyToken, authMiddleware.attachUserId, async (req, res) => {
   try {
     if (
