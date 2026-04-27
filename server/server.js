@@ -10,6 +10,7 @@ const bcrypt = require("bcrypt");
 const sgMail = require("@sendgrid/mail");
 const openai = require("openai");
 const cron = require('node-cron');
+const moment = require("moment-timezone");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const validator = require("validator");
@@ -462,6 +463,17 @@ const behaviorSchema = new mongoose.Schema({
   goalStatus: {
     type: String,
   },
+  // Phase 13.7 / F4 — optional mood self-report. Tracked alongside the
+  // behavior so chatbot context + future research can correlate mood with
+  // goal achievement. Enum-bounded to prevent free-text PII; nullable so
+  // pre-mood-feature behaviors keep validating. PI explicitly authorized
+  // adding this field on 2026-04-27 ahead of formal IRB amendment — see
+  // workdone.md override entry.
+  mood: {
+    type: String,
+    enum: ["very_low", "low", "neutral", "good", "great", null],
+    default: null,
+  },
   divInfo1: {
     type: String,
   },
@@ -708,6 +720,70 @@ const revokedTokenSchema = new mongoose.Schema({
 });
 const RevokedToken = mongoose.model("RevokedToken", revokedTokenSchema);
 
+// ===========================================================================
+// Phase 13.7 — adult-notification on crisis flags. Per the IRB amendment
+// design (irb_amendment_phase_13_7_draft.md): when SafetyEvent.action ===
+// "crisis_response" fires, enqueue a NotificationDispatch row. A daily 7 AM
+// Central cron batches all queued dispatches and sends ONE digest email per
+// counselor (currently a single COUNSELOR_EMAIL env var; per-school routing
+// is a Phase 13.7.1 follow-up). Email contains ZERO PII / message text —
+// only the timestamp + last-3-chars of student ID. Counselor calls the lab
+// to retrieve the thread.
+//
+// PI / PROFESSOR EXPLICITLY AUTHORIZED THIS BUILD AHEAD OF FORMAL IRB
+// AMENDMENT APPROVAL on 2026-04-27 ("i have permission" — see workdone.md
+// override entry of the same date). The cron is structurally safe even
+// pre-approval: with COUNSELOR_EMAIL unset, the cron NO-OPs and logs;
+// nothing is emailed. Operator must (a) configure COUNSELOR_EMAIL on
+// Render AND (b) confirm IRB sign-off + privacy policy update + parental
+// consent form distribution before the dispatcher actually emails anyone.
+// ===========================================================================
+const notificationDispatchSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  sessionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "ChatSession",
+    required: true,
+  },
+  // Mirrors SafetyEvent.action so we can filter dispatch types later
+  // (e.g. only crisis_response gets a counselor email; harmful_redirect
+  // is metadata-only).
+  action: {
+    type: String,
+    required: true,
+    enum: ["crisis_response", "harmful_redirect", "output_swapped"],
+  },
+  status: {
+    type: String,
+    required: true,
+    enum: ["queued", "dispatched", "failed", "skipped_no_recipient"],
+    default: "queued",
+    index: true,
+  },
+  triggeredAt: { type: Date, default: Date.now },
+  dispatchedAt: { type: Date },
+  // Surface a brief failure note for operator triage; never includes PII.
+  lastError: { type: String },
+  // 1-year retention matches SafetyEvent — same audit window.
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+notificationDispatchSchema.index({ status: 1, triggeredAt: 1 });
+const NotificationDispatch = mongoose.model(
+  "NotificationDispatch",
+  notificationDispatchSchema
+);
+
+function notificationDispatchExpiresAt() {
+  const d = new Date();
+  d.setDate(d.getDate() + SAFETY_EVENT_RETENTION_DAYS);
+  return d;
+}
+
 
 //delete file everyday it passes 
 
@@ -927,6 +1003,17 @@ app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, 
       date: req.body.date,
     });
     
+    // Whitelist mood server-side so a malformed client can't inject
+    // arbitrary strings. Anything outside the enum collapses to null.
+    const allowedMoods = new Set([
+      "very_low",
+      "low",
+      "neutral",
+      "good",
+      "great",
+    ]);
+    const mood = allowedMoods.has(req.body.mood) ? req.body.mood : null;
+
     const newBehaviorData = {
       dateToday: req.body.dateToday,
       behaviorValue: req.body.behaviorValue,
@@ -938,6 +1025,7 @@ app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, 
       reflection: req.body.reflection,
       recommendedValue: req.body.recommendedValue,
       feedback: req.body.feedback,
+      mood,
     };
 
     // Add new fields based on goalType
@@ -1055,6 +1143,9 @@ app.delete(
         // COPPA right-to-delete trumps research audit retention: when
         // a user deletes their account, their safety events go too.
         () => SafetyEvent.deleteMany({ userId }),
+        // Phase 13.7 — adult-notification dispatch queue. Same Apple/COPPA
+        // reasoning: account deletion wipes all derived records.
+        () => NotificationDispatch.deleteMany({ userId }),
       ];
       for (const run of cascades) {
         try {
@@ -1529,6 +1620,29 @@ app.post(
           console.error("SafetyEvent persist error:", auditErr);
         }
 
+        // Phase 13.7 — enqueue an adult-notification ONLY for the crisis
+        // category. harmful_redirect doesn't escalate (gentle nudge case).
+        // The cron at 7 AM Central picks queued rows up and emails the
+        // configured COUNSELOR_EMAIL. Failure here must not block the
+        // crisis canned reply.
+        if (isCrisis) {
+          try {
+            await NotificationDispatch.create({
+              userId: req._id,
+              sessionId: session._id,
+              action,
+              status: "queued",
+              triggeredAt: now,
+              expiresAt: notificationDispatchExpiresAt(),
+            });
+          } catch (dispatchErr) {
+            console.error(
+              "NotificationDispatch enqueue error:",
+              dispatchErr
+            );
+          }
+        }
+
         // Telemetry: log session/user + categories + action only.
         // Never log the flagged user text.
         console.log(
@@ -1808,6 +1922,166 @@ app.delete(
 app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
+
+// ===========================================================================
+// Phase 13.7 — daily 7 AM Central counselor digest cron.
+//
+// Picks up all NotificationDispatch rows with status="queued" and action=
+// "crisis_response", batches them into ONE email per dispatch run, sends
+// to COUNSELOR_EMAIL via SendGrid (same provider already used for
+// verification codes), marks each row "dispatched" or "failed" with a
+// brief lastError. Runs even if no rows exist (cheap no-op query).
+//
+// HARD GATES — NOTHING IS EMAILED unless ALL of these are true:
+//   1. process.env.COUNSELOR_EMAIL is set (operator config — has to be
+//      explicitly added to Render env vars; absence = silent no-op)
+//   2. process.env.COUNSELOR_DISPATCH_ENABLED === "true" (a second
+//      kill-switch so even with the email var set, dispatch stays off
+//      until IRB amendment + privacy policy + parental consent are all
+//      in production)
+//
+// Both gates default to OFF. Operator must affirmatively turn them on.
+// PI authorized building this code on 2026-04-27 ("i have permission")
+// but the dual-gate pattern preserves the actual operational requirement
+// that no email goes out until the IRB amendment lands.
+//
+// Email body contains ZERO PII / message text — only:
+//   - timestamp (Central)
+//   - last 3 chars of student id (so counselor can call lab to retrieve
+//     full thread without PII traveling over email)
+// Counselor calls the lab for thread review — by design.
+// ===========================================================================
+async function runCounselorDispatch() {
+  const recipient = process.env.COUNSELOR_EMAIL;
+  const enabled = process.env.COUNSELOR_DISPATCH_ENABLED === "true";
+
+  // Always log a heartbeat so operator can see the cron is alive.
+  console.log(
+    `[counselor-dispatch] tick at ${new Date().toISOString()} ` +
+      `recipientSet=${!!recipient} enabled=${enabled}`
+  );
+
+  // Find queued crisis dispatches regardless of gate state — so when
+  // gates open, the backlog flushes immediately rather than starting
+  // from "now."
+  let queued;
+  try {
+    queued = await NotificationDispatch.find({
+      status: "queued",
+      action: "crisis_response",
+    })
+      .sort({ triggeredAt: 1 })
+      .limit(200)
+      .lean();
+  } catch (err) {
+    console.error("[counselor-dispatch] query error:", err);
+    return;
+  }
+
+  if (queued.length === 0) {
+    return;
+  }
+
+  // Gate 1 + Gate 2: if either is off, mark the rows skipped_no_recipient
+  // (so we don't keep retrying) and DON'T email. Operator can re-enable
+  // by re-running the dispatcher manually after flipping gates.
+  if (!recipient || !enabled) {
+    console.log(
+      `[counselor-dispatch] ${queued.length} queued event(s) but ` +
+        `gates closed — marking skipped_no_recipient (no email sent).`
+    );
+    try {
+      await NotificationDispatch.updateMany(
+        {
+          _id: { $in: queued.map((q) => q._id) },
+        },
+        {
+          $set: {
+            status: "skipped_no_recipient",
+            dispatchedAt: new Date(),
+            lastError: !recipient
+              ? "COUNSELOR_EMAIL not configured"
+              : "COUNSELOR_DISPATCH_ENABLED is not 'true'",
+          },
+        }
+      );
+    } catch (markErr) {
+      console.error("[counselor-dispatch] mark-skipped error:", markErr);
+    }
+    return;
+  }
+
+  // Both gates open — build the digest. Per IRB amendment design: NO
+  // user content, NO email addresses, NO names. Just timestamp + last
+  // 3 chars of userId so the counselor can call the lab to retrieve
+  // the thread.
+  const lines = queued.map((d) => {
+    const central = moment(d.triggeredAt).tz("America/Chicago").format(
+      "YYYY-MM-DD HH:mm z"
+    );
+    const idTail = String(d.userId).slice(-3);
+    return `  • ${central}  student#…${idTail}  category: crisis`;
+  });
+  const subject = `ProudMe daily safety digest — ${queued.length} crisis flag(s)`;
+  const text =
+    `This is the daily ProudMe safety digest from the LSU Pedagogical ` +
+    `Kinesiology Lab (PI: Project ProudMe).\n\n` +
+    `${queued.length} student message(s) were flagged in the past 24 ` +
+    `hours by the in-app content classifier as a possible crisis (self-` +
+    `harm category). The student was shown the in-app crisis-resource ` +
+    `screen at the moment of the flag (988 Suicide & Crisis Lifeline, ` +
+    `Crisis Text Line, 911).\n\n` +
+    `For thread review (PI eyes only), please contact the ProudMe lab ` +
+    `with the timestamp and student tail below. NO message text or ` +
+    `student email is included in this digest by design.\n\n` +
+    `Flagged events (Central time):\n${lines.join("\n")}\n\n` +
+    `— ProudMe automated safety dispatcher (Phase 13.7)\n` +
+    `Lab contact: pklab@projectproudme.com`;
+
+  const msg = {
+    to: recipient,
+    from: "pklab@projectproudme.com",
+    subject,
+    text,
+  };
+
+  try {
+    await sgMail.send(msg);
+    await NotificationDispatch.updateMany(
+      { _id: { $in: queued.map((q) => q._id) } },
+      { $set: { status: "dispatched", dispatchedAt: new Date() } }
+    );
+    console.log(
+      `[counselor-dispatch] dispatched ${queued.length} crisis flag(s) ` +
+        `to ${recipient.replace(/(.{2}).+(@.*)/, "$1***$2")}`
+    );
+  } catch (sendErr) {
+    const errText =
+      sendErr && sendErr.message
+        ? String(sendErr.message).slice(0, 200)
+        : "send failed";
+    console.error("[counselor-dispatch] SendGrid error:", errText);
+    try {
+      await NotificationDispatch.updateMany(
+        { _id: { $in: queued.map((q) => q._id) } },
+        { $set: { status: "failed", lastError: errText } }
+      );
+    } catch (markErr) {
+      console.error("[counselor-dispatch] mark-failed error:", markErr);
+    }
+  }
+}
+
+// Schedule: every day at 7:00 AM Central (America/Chicago handles DST).
+// node-cron uses 5-field cron expressions: minute hour dom month dow.
+// "0 7 * * *" = 07:00 every day.
+cron.schedule("0 7 * * *", runCounselorDispatch, {
+  scheduled: true,
+  timezone: "America/Chicago",
+});
+console.log(
+  "[counselor-dispatch] cron registered for 07:00 America/Chicago daily."
+);
 
 // Process-level safety net. If a future code path drops a rejected promise
 // (the way /chatbot did before its .catch was added), we'd rather log + keep
