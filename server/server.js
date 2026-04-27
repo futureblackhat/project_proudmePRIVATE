@@ -119,6 +119,51 @@ const MODERATION_FALLBACK_REPLY =
   "Hmm, let me think about that differently. " +
   "Want to chat about your sleep, screen time, or what you ate today?";
 
+// Phase 13.6 — when input moderation flags a USER message for self-harm
+// (suicidal ideation, self-injury), short-circuit the OpenAI chat call
+// and respond with real crisis resources. NOT a generic redirect — a kid
+// in crisis deserves accurate phone numbers + the explicit prompt to
+// tell a trusted adult. Numbers are US-current as of 2026-04-27.
+//
+// IMPORTANT: this is the canned reply only. Adult / counselor / parent
+// notification is INTENTIONALLY not implemented here — see workdone.md
+// Phase 13.6 entry for the IRB-amendment work that has to land before
+// auto-notification can ship (chain-of-care decisions, FERPA/COPPA
+// disclosure updates, false-positive blast radius, and 24/7 coverage).
+const CRISIS_RESPONSE =
+  "I hear you, and what you said matters. Please talk to a trusted adult " +
+  "right now — a parent, your school nurse, a counselor, or a teacher. " +
+  "You don't have to handle this alone.\n\n" +
+  "If you're feeling unsafe or thinking about hurting yourself, please " +
+  "reach out for help right away:\n\n" +
+  "• Call or text 988 — the Suicide & Crisis Lifeline (24/7, free, " +
+  "confidential)\n" +
+  "• Text HOME to 741741 — the Crisis Text Line (24/7, free)\n" +
+  "• If you're in immediate danger, call 911\n\n" +
+  "You matter, and there are people trained to help. Please tell someone " +
+  "you trust today.";
+
+// Phase 13.6 — when input moderation flags a USER message for OTHER
+// harmful content (violence, sexual, hate, harassment) that isn't
+// self-directed self-harm, redirect kindly without escalating to crisis
+// resources. "I hate my sister" shouldn't get the same response as
+// suicidal ideation; this catches that gap.
+const HARMFUL_INPUT_REDIRECT =
+  "Let's keep our chat focused on healthy habits. If something's bothering " +
+  "you, please talk to a trusted adult — a parent, teacher, or school " +
+  "counselor. We can chat about your goals: sleep, screen time, exercise, " +
+  "or eating well.";
+
+// OpenAI moderation categories that trigger the CRISIS_RESPONSE path.
+// Self-harm AND violence-self are both treated as crisis-level. Other
+// flagged categories (sexual, hate, harassment, violence) route to
+// HARMFUL_INPUT_REDIRECT instead.
+const CRISIS_CATEGORIES = new Set([
+  "self-harm",
+  "self-harm/intent",
+  "self-harm/instructions",
+]);
+
 // Run OpenAI's moderation API on a string and return whether it should be
 // blocked. omni-moderation-latest is the current GA classifier — covers
 // self-harm, violence, sexual content, hate, and harassment categories.
@@ -150,6 +195,38 @@ async function moderateAssistantOutput(text) {
   } catch (err) {
     console.error("Moderation API error:", err && err.message ? err.message : err);
     return { flagged: false, error: true };
+  }
+}
+
+// Phase 13.6 — moderate USER input BEFORE the gpt-4o-mini call. Returns
+// { flagged, isCrisis, categories }. isCrisis is true when ANY flagged
+// category is in CRISIS_CATEGORIES (self-harm family) — that drives the
+// crisis-response path. Same fail-OPEN posture as the output helper.
+async function moderateUserInput(text) {
+  if (!text || typeof text !== "string") {
+    return { flagged: false, isCrisis: false, categories: [] };
+  }
+  try {
+    const res = await openaiInstance.moderations.create({
+      model: "omni-moderation-latest",
+      input: text,
+    });
+    const result = res && res.results && res.results[0];
+    if (!result) return { flagged: false, isCrisis: false, categories: [] };
+    if (!result.flagged) {
+      return { flagged: false, isCrisis: false, categories: [] };
+    }
+    const categories = Object.entries(result.categories || {})
+      .filter(([, v]) => v === true)
+      .map(([k]) => k);
+    const isCrisis = categories.some((c) => CRISIS_CATEGORIES.has(c));
+    return { flagged: true, isCrisis, categories };
+  } catch (err) {
+    console.error(
+      "Input moderation API error:",
+      err && err.message ? err.message : err
+    );
+    return { flagged: false, isCrisis: false, categories: [], error: true };
   }
 }
 
@@ -554,6 +631,58 @@ chatMessageSchema.index({ userId: 1, sessionId: 1, timestamp: 1 });
 const ChatSession = mongoose.model("ChatSession", chatSessionSchema);
 const ChatMessage = mongoose.model("ChatMessage", chatMessageSchema);
 
+// Phase 13.6 — audit collection for moderation safety events. Survives the
+// 30-day chat TTL (1-year retention) so the PI/IRB has a paper trail of
+// when, how often, and what category of safety events occur in the field.
+// Crucially, this does NOT store the flagged user content — only the
+// metadata (category list, action taken, timestamps). That lets the
+// research team monitor safety-event rates without violating retention
+// minimization (or letting concerning text linger in DB longer than the
+// privacy policy promises).
+const safetyEventSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  sessionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "ChatSession",
+    required: true,
+  },
+  source: {
+    type: String,
+    required: true,
+    enum: ["input", "output"],
+  },
+  categories: { type: [String], default: [] },
+  action: {
+    type: String,
+    required: true,
+    enum: ["crisis_response", "harmful_redirect", "output_swapped"],
+  },
+  timestamp: { type: Date, default: Date.now },
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+safetyEventSchema.index({ userId: 1, timestamp: -1 });
+safetyEventSchema.index({ action: 1, timestamp: -1 });
+const SafetyEvent = mongoose.model("SafetyEvent", safetyEventSchema);
+
+// 1-year retention for safety audit events. Long enough for IRB monitoring
+// + parental request response window, short enough to honor data
+// minimization. Configurable via env var if the IRB amendment requires
+// shorter or longer.
+const SAFETY_EVENT_RETENTION_DAYS = parseInt(
+  process.env.SAFETY_EVENT_RETENTION_DAYS || "365",
+  10
+);
+function safetyEventExpiresAt() {
+  const d = new Date();
+  d.setDate(d.getDate() + SAFETY_EVENT_RETENTION_DAYS);
+  return d;
+}
+
 // Compute a fresh expiresAt = now + CHAT_RETENTION_DAYS. Centralized so a
 // future retention-window change is one edit, not five.
 function chatExpiresAt() {
@@ -916,6 +1045,10 @@ app.delete(
         // collection names spelled out so search doesn't miss them.
         () => ChatSession.deleteMany({ userId }),
         () => ChatMessage.deleteMany({ userId }),
+        // Phase 13.6 — moderation audit events. Apple 5.1.1(v) +
+        // COPPA right-to-delete trumps research audit retention: when
+        // a user deletes their account, their safety events go too.
+        () => SafetyEvent.deleteMany({ userId }),
       ];
       for (const run of cascades) {
         try {
@@ -1319,6 +1452,92 @@ app.post(
           .send("Forbidden: cannot write to another user's session.");
       }
 
+      // Phase 13.6 — moderate the USER message BEFORE we let it hit
+      // gpt-4o-mini. Crisis-category flags (self-harm family) get the
+      // CRISIS_RESPONSE path with real hotline numbers; other flagged
+      // categories (violence/sexual/hate/harassment) get the gentler
+      // HARMFUL_INPUT_REDIRECT. Either way: short-circuit, never call
+      // OpenAI chat with the flagged input, log a SafetyEvent for
+      // PI/IRB audit, persist the canned reply as the assistant turn.
+      const inputModeration = await moderateUserInput(userText);
+      if (inputModeration.flagged) {
+        const isCrisis = inputModeration.isCrisis;
+        const cannedReply = isCrisis
+          ? CRISIS_RESPONSE
+          : HARMFUL_INPUT_REDIRECT;
+        const action = isCrisis ? "crisis_response" : "harmful_redirect";
+
+        const now = new Date();
+        const expiresAt = chatExpiresAt();
+
+        const userMsg = await ChatMessage.create({
+          sessionId: session._id,
+          userId: req._id,
+          role: "user",
+          content: userText,
+          timestamp: now,
+          expiresAt,
+        });
+        const assistantMsg = await ChatMessage.create({
+          sessionId: session._id,
+          userId: req._id,
+          role: "assistant",
+          content: cannedReply,
+          timestamp: new Date(now.getTime() + 1),
+          expiresAt,
+        });
+
+        // Long-retention audit trail (1 year by default). Crucially does
+        // NOT store userText — only the metadata IRB needs for monitoring.
+        try {
+          await SafetyEvent.create({
+            userId: req._id,
+            sessionId: session._id,
+            source: "input",
+            categories: inputModeration.categories,
+            action,
+            timestamp: now,
+            expiresAt: safetyEventExpiresAt(),
+          });
+        } catch (auditErr) {
+          // SafetyEvent.create failing must not block the canned reply
+          // from reaching the kid — log and continue.
+          console.error("SafetyEvent persist error:", auditErr);
+        }
+
+        // Telemetry: log session/user + categories + action only.
+        // Never log the flagged user text.
+        console.log(
+          `chat input flagged action=${action} session=${session._id} user=${req._id} categories=${inputModeration.categories.join(",")}`
+        );
+
+        session.lastMessageAt = now;
+        session.messageCount += 2;
+        session.expiresAt = expiresAt;
+        await session.save();
+
+        return res.status(200).json({
+          userMessage: {
+            id: userMsg._id,
+            role: "user",
+            content: userMsg.content,
+            timestamp: userMsg.timestamp,
+          },
+          assistantMessage: {
+            id: assistantMsg._id,
+            role: "assistant",
+            content: assistantMsg.content,
+            timestamp: assistantMsg.timestamp,
+          },
+          sessionTitle: session.title,
+          // Mobile can use this signal to render the response with extra
+          // visual emphasis (e.g. don't TTS the crisis hotline silently
+          // — it's important the kid SEES the numbers, not just hears
+          // them once and they vanish).
+          safetyAction: action,
+        });
+      }
+
       // Pull last N messages for short-term conversation context. The
       // assistant only needs recent turns — older history would explode
       // the prompt size + cost without a meaningful quality bump.
@@ -1374,6 +1593,22 @@ app.post(
         console.log(
           `chat moderation flagged session=${session._id} user=${req._id} categories=${(moderation.categories || []).join(",")}`
         );
+        // Audit trail (Phase 13.6) — same retention as input flags so
+        // PI/IRB can see input-side AND output-side safety events on
+        // one timeline. Best-effort; failure must not block reply.
+        try {
+          await SafetyEvent.create({
+            userId: req._id,
+            sessionId: session._id,
+            source: "output",
+            categories: moderation.categories || [],
+            action: "output_swapped",
+            timestamp: new Date(),
+            expiresAt: safetyEventExpiresAt(),
+          });
+        } catch (auditErr) {
+          console.error("SafetyEvent persist error (output):", auditErr);
+        }
       }
 
       const now = new Date();
