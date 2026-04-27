@@ -109,6 +109,50 @@ const CHAT_RETENTION_DAYS = parseInt(
   10
 );
 
+// Phase 13.5 — when the moderation API flags an assistant response, swap
+// in this neutral redirect instead of returning the original. Phrased so
+// it's safe to read aloud via TTS to a minor and lands the conversation
+// back on health-goal turf. Persisted in place of the flagged content
+// (we never store the original text once flagged, so it can't leak via
+// history reads).
+const MODERATION_FALLBACK_REPLY =
+  "Hmm, let me think about that differently. " +
+  "Want to chat about your sleep, screen time, or what you ate today?";
+
+// Run OpenAI's moderation API on a string and return whether it should be
+// blocked. omni-moderation-latest is the current GA classifier — covers
+// self-harm, violence, sexual content, hate, and harassment categories.
+// FREE endpoint — does NOT bill against the chat completion budget.
+//
+// Failure mode: if the moderation API itself errors (network blip, OpenAI
+// outage), we fail OPEN and let the original text through. Reasoning: the
+// COACH_PEBBLE_PERSONA + 75-token cap already heavily constrains output,
+// so moderation is the last line of defense, not the first. A moderation
+// outage shouldn't take chat down. The error gets logged for observability.
+async function moderateAssistantOutput(text) {
+  if (!text || typeof text !== "string") {
+    return { flagged: false };
+  }
+  try {
+    const res = await openaiInstance.moderations.create({
+      model: "omni-moderation-latest",
+      input: text,
+    });
+    const result = res && res.results && res.results[0];
+    if (!result) return { flagged: false };
+    if (result.flagged) {
+      const categories = Object.entries(result.categories || {})
+        .filter(([, v]) => v === true)
+        .map(([k]) => k);
+      return { flagged: true, categories };
+    }
+    return { flagged: false };
+  } catch (err) {
+    console.error("Moderation API error:", err && err.message ? err.message : err);
+    return { flagged: false, error: true };
+  }
+}
+
 // 20 chatbot calls per hour per authenticated user. Each call hits OpenAI at
 // real cost; without this a stolen JWT can loop and drain the lab's OpenAI
 // budget. Keyed by req._id so it survives shared NAT / school WiFi.
@@ -1306,7 +1350,7 @@ app.post(
         presence_penalty: 0.6,
       });
 
-      const replyText =
+      const rawReplyText =
         (completion.choices &&
           completion.choices[0] &&
           completion.choices[0].message &&
@@ -1314,6 +1358,23 @@ app.post(
         "Sorry, I couldn't think of a good answer just now.";
       const tokensUsed =
         (completion.usage && completion.usage.total_tokens) || 0;
+
+      // Phase 13.5 — moderate the assistant response BEFORE it can be
+      // persisted, returned to the client, or read aloud by voice mode.
+      // If flagged, swap in a neutral redirect; we never store the
+      // flagged original so it can't leak via history reads.
+      const moderation = await moderateAssistantOutput(rawReplyText);
+      const replyText = moderation.flagged
+        ? MODERATION_FALLBACK_REPLY
+        : rawReplyText;
+      if (moderation.flagged) {
+        // Telemetry: log session/user + flagged categories ONLY. Never
+        // log the flagged content — that's user PII (or worse) and we
+        // just declined to keep it.
+        console.log(
+          `chat moderation flagged session=${session._id} user=${req._id} categories=${(moderation.categories || []).join(",")}`
+        );
+      }
 
       const now = new Date();
       const expiresAt = chatExpiresAt();
