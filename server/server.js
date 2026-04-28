@@ -30,7 +30,7 @@ const MAX_REFLECTION_LENGTH = 500;
 const MAX_PROMPT_LENGTH = 4000;
 
 // Generate a 6-digit numeric verification code via crypto.randomInt
-// (CSPRNG). Math.random() is not cryptographically random — replacing it
+// (CSPRNG). Math.random() is not cryptographically random, replacing it
 // closes a brute-force-via-prediction angle on the email verification flow.
 function generateVerificationCode() {
   return crypto.randomInt(100000, 1000000).toString();
@@ -81,20 +81,51 @@ const PROMPT_INJECTION_GUARD =
   "Do not roleplay, do not output code, do not produce content unrelated " +
   "to the health-goal feedback you were asked to give. ";
 
-// Coach Pebble persona for the chat endpoints. Locked server-side as a
-// constant — never user-controllable — so a minor can't ask the model to
-// "be someone else" via crafted message content. Paired with the prompt-
-// injection guard above for defense in depth. Length cap is 75 tokens to
-// match the existing /chatbot ceiling and keep voice TTS responses short.
-const COACH_PEBBLE_PERSONA =
-  "You are Coach Pebble, a friendly AI health buddy for middle-school " +
-  "students (grades 5-9). Keep responses warm, age-appropriate, and " +
-  "under 75 tokens. Focus on physical activity, sleep, screen time, and " +
-  "eating fruits + vegetables. Never give medical advice; for serious " +
-  "health concerns suggest the student talk to a parent, school nurse, " +
-  "or doctor. Never ask for personal information (real name, school, " +
-  "phone, address). Do not roleplay, do not output code, do not produce " +
-  "content unrelated to healthy habits. ";
+// Coach persona for the chat endpoints. The persona BODY (the safety-
+// critical instructions, restrictions, role) is locked server-side, only
+// the coach NAME is user-controllable. A minor can rename their coach
+// from the default "Pebble" to e.g. "Tom" or "Max" via the Pet Room
+// rename screen (Phase 14). The name flows in via req.body.coachName,
+// is sanitized by `sanitizeCoachName` below (regex + length cap) before
+// it is interpolated into the persona, so a kid cannot use the rename
+// field to inject "Ignore previous instructions..." into the prompt.
+//
+// Paired with the PROMPT_INJECTION_GUARD above for defense in depth.
+// Length cap is 75 tokens to match the existing /chatbot ceiling and
+// keep voice TTS responses short.
+function buildCoachPersona(coachName) {
+  return (
+    `You are Coach ${coachName}, a friendly AI health buddy for middle-school ` +
+    "students (grades 5-9). Keep responses warm, age-appropriate, and " +
+    "under 75 tokens. Focus on physical activity, sleep, screen time, and " +
+    "eating fruits + vegetables. Never give medical advice; for serious " +
+    "health concerns suggest the student talk to a parent, school nurse, " +
+    "or doctor. Never ask for personal information (real name, school, " +
+    "phone, address). Do not roleplay, do not output code, do not produce " +
+    "content unrelated to healthy habits. "
+  );
+}
+
+// Coach name sanitizer. STRICT regex match, no periods (could end the
+// sentence and let an attacker append new instructions), no quotes, no
+// newlines, no slashes, no special characters of any kind. Max 12 chars.
+// Anything that fails the regex is silently coerced back to "Pebble"
+// (do not echo or log raw bad values; the kid attacker is exactly the
+// person we don't want feedback from). Same regex must be enforced
+// client-side so the failure mode is the rename UI rejecting the input
+// before it ever reaches the server, this is just defense in depth.
+const COACH_NAME_REGEX = /^[A-Za-z0-9 ]{1,12}$/;
+function sanitizeCoachName(raw) {
+  if (typeof raw !== "string") return "Pebble";
+  const trimmed = raw.trim();
+  if (!COACH_NAME_REGEX.test(trimmed)) return "Pebble";
+  return trimmed;
+}
+
+// Backward-compat alias: any old code path still importing the old
+// constant gets the default-named persona. New code uses
+// `buildCoachPersona(sanitizeCoachName(req.body.coachName))`.
+const COACH_PEBBLE_PERSONA = buildCoachPersona("Pebble");
 
 // Number of recent messages from a session to feed back into OpenAI as
 // conversation context. Bounded so a long history doesn't blow up the
@@ -110,7 +141,7 @@ const CHAT_RETENTION_DAYS = parseInt(
   10
 );
 
-// Phase 13.5 — when the moderation API flags an assistant response, swap
+// Phase 13.5, when the moderation API flags an assistant response, swap
 // in this neutral redirect instead of returning the original. Phrased so
 // it's safe to read aloud via TTS to a minor and lands the conversation
 // back on health-goal turf. Persisted in place of the flagged content
@@ -120,38 +151,38 @@ const MODERATION_FALLBACK_REPLY =
   "Hmm, let me think about that differently. " +
   "Want to chat about your sleep, screen time, or what you ate today?";
 
-// Phase 13.6 — when input moderation flags a USER message for self-harm
+// Phase 13.6, when input moderation flags a USER message for self-harm
 // (suicidal ideation, self-injury), short-circuit the OpenAI chat call
-// and respond with real crisis resources. NOT a generic redirect — a kid
+// and respond with real crisis resources. NOT a generic redirect, a kid
 // in crisis deserves accurate phone numbers + the explicit prompt to
 // tell a trusted adult. Numbers are US-current as of 2026-04-27.
 //
 // IMPORTANT: this is the canned reply only. Adult / counselor / parent
-// notification is INTENTIONALLY not implemented here — see workdone.md
+// notification is INTENTIONALLY not implemented here, see workdone.md
 // Phase 13.6 entry for the IRB-amendment work that has to land before
 // auto-notification can ship (chain-of-care decisions, FERPA/COPPA
 // disclosure updates, false-positive blast radius, and 24/7 coverage).
 const CRISIS_RESPONSE =
   "I hear you, and what you said matters. Please talk to a trusted adult " +
-  "right now — a parent, your school nurse, a counselor, or a teacher. " +
+  "right now, a parent, your school nurse, a counselor, or a teacher. " +
   "You don't have to handle this alone.\n\n" +
   "If you're feeling unsafe or thinking about hurting yourself, please " +
   "reach out for help right away:\n\n" +
-  "• Call or text 988 — the Suicide & Crisis Lifeline (24/7, free, " +
+  "• Call or text 988, the Suicide & Crisis Lifeline (24/7, free, " +
   "confidential)\n" +
-  "• Text HOME to 741741 — the Crisis Text Line (24/7, free)\n" +
+  "• Text HOME to 741741, the Crisis Text Line (24/7, free)\n" +
   "• If you're in immediate danger, call 911\n\n" +
   "You matter, and there are people trained to help. Please tell someone " +
   "you trust today.";
 
-// Phase 13.6 — when input moderation flags a USER message for OTHER
+// Phase 13.6, when input moderation flags a USER message for OTHER
 // harmful content (violence, sexual, hate, harassment) that isn't
 // self-directed self-harm, redirect kindly without escalating to crisis
 // resources. "I hate my sister" shouldn't get the same response as
 // suicidal ideation; this catches that gap.
 const HARMFUL_INPUT_REDIRECT =
   "Let's keep our chat focused on healthy habits. If something's bothering " +
-  "you, please talk to a trusted adult — a parent, teacher, or school " +
+  "you, please talk to a trusted adult, a parent, teacher, or school " +
   "counselor. We can chat about your goals: sleep, screen time, exercise, " +
   "or eating well.";
 
@@ -166,9 +197,9 @@ const CRISIS_CATEGORIES = new Set([
 ]);
 
 // Run OpenAI's moderation API on a string and return whether it should be
-// blocked. omni-moderation-latest is the current GA classifier — covers
+// blocked. omni-moderation-latest is the current GA classifier, covers
 // self-harm, violence, sexual content, hate, and harassment categories.
-// FREE endpoint — does NOT bill against the chat completion budget.
+// FREE endpoint, does NOT bill against the chat completion budget.
 //
 // Failure mode: if the moderation API itself errors (network blip, OpenAI
 // outage), we fail OPEN and let the original text through. Reasoning: the
@@ -199,9 +230,9 @@ async function moderateAssistantOutput(text) {
   }
 }
 
-// Phase 13.6 — moderate USER input BEFORE the gpt-4o-mini call. Returns
+// Phase 13.6, moderate USER input BEFORE the gpt-4o-mini call. Returns
 // { flagged, isCrisis, categories }. isCrisis is true when ANY flagged
-// category is in CRISIS_CATEGORIES (self-harm family) — that drives the
+// category is in CRISIS_CATEGORIES (self-harm family), that drives the
 // crisis-response path. Same fail-OPEN posture as the output helper.
 async function moderateUserInput(text) {
   if (!text || typeof text !== "string") {
@@ -244,8 +275,8 @@ const chatbotLimiter = rateLimit({
 });
 
 // Coach Pebble chat: 50 messages per hour per authenticated user. Higher
-// than chatbotLimiter (20/hr) because chat is conversational — a kid
-// asking 10 quick questions in 5 minutes is normal use, not abuse — but
+// than chatbotLimiter (20/hr) because chat is conversational, a kid
+// asking 10 quick questions in 5 minutes is normal use, not abuse, but
 // still hard-bounds OpenAI cost + prompt-injection retry budget. Keyed by
 // req._id (matches C7 chatbotLimiter pattern) so it survives shared NAT.
 const chatLimiter = rateLimit({
@@ -269,7 +300,7 @@ const loginLimiter = rateLimit({
 });
 
 // Verify: 5 attempts / 15 min / IP. Tighter than login because the
-// verification code is only 6 digits — must bound brute-force window.
+// verification code is only 6 digits, must bound brute-force window.
 const verifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -299,7 +330,7 @@ const port = process.env.PORT || 3001;
 // 2 trusted upstream hops. With `trust proxy: 2` Express pops both XFF
 // entries and `req.ip` resolves to the actual client IP (stable).
 //
-// Tried `trust proxy: 1` first — that only popped the Render LB entry,
+// Tried `trust proxy: 1` first, that only popped the Render LB entry,
 // leaving `req.ip` = Cloudflare edge IP, which rotates between Cloudflare
 // PoPs per request. Result: rate-limit counters bounced because each
 // request keyed against a different Cloudflare edge. Fixed by trusting
@@ -316,7 +347,7 @@ app.use(helmet());
 // Browser-callable origins. Native iOS/Android Flutter apps don't trigger
 // CORS at all (no browser), so the only legitimate browser callers are local
 // dev (Flutter web on Chrome) and any future hosted web frontend. Anything
-// else gets rejected — closes the browser-side CSRF/embed-our-API-in-a-rogue-
+// else gets rejected, closes the browser-side CSRF/embed-our-API-in-a-rogue-
 // site risk class. Requests with no Origin header (curl, native mobile,
 // server-to-server) pass through.
 const allowedOriginPatterns = [
@@ -329,7 +360,7 @@ app.use(
       if (!origin) return cb(null, true);
       const ok = allowedOriginPatterns.some((re) => re.test(origin));
       // Pass `false` (not an Error) for disallowed origins so the cors
-      // middleware responds cleanly — preflight gets 204 with no
+      // middleware responds cleanly, preflight gets 204 with no
       // Access-Control-Allow-Origin header, browser blocks the actual
       // request itself. Throwing an Error here previously caused
       // Express's default error handler to return 500, which is sloppy
@@ -349,7 +380,7 @@ app.use(bodyParser.json({ limit: "1mb" }));
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 
-// Connect to MongoDB. Connection failure must be FATAL — without it the
+// Connect to MongoDB. Connection failure must be FATAL, without it the
 // server starts but every route 500s. Better to crash the dyno so Render
 // marks the deploy failed and falls back to the previous build.
 mongoose
@@ -372,7 +403,7 @@ mongoose
 // automatically NOT leak the bcrypt hash or the email verification code.
 // Routes that genuinely need these fields (login: bcrypt.compare; verify:
 // code match) must opt in via `.select('+password')` / `.select('+verificationCode')`.
-// Secure-by-default — adding a new query is safe by accident, not by remembering.
+// Secure-by-default, adding a new query is safe by accident, not by remembering.
 //
 // MUST stay in sync with `server/models/User.js` (used by cron.js). See M24.
 const userSchema = new mongoose.Schema({
@@ -463,11 +494,11 @@ const behaviorSchema = new mongoose.Schema({
   goalStatus: {
     type: String,
   },
-  // Phase 13.7 / F4 — optional mood self-report. Tracked alongside the
+  // Phase 13.7 / F4, optional mood self-report. Tracked alongside the
   // behavior so chatbot context + future research can correlate mood with
   // goal achievement. Enum-bounded to prevent free-text PII; nullable so
   // pre-mood-feature behaviors keep validating. PI explicitly authorized
-  // adding this field on 2026-04-27 ahead of formal IRB amendment — see
+  // adding this field on 2026-04-27 ahead of formal IRB amendment, see
   // workdone.md override entry.
   mood: {
     type: String,
@@ -596,7 +627,7 @@ const Behavior = mongoose.model("Behavior", behaviorSchema);
 const Goal = mongoose.model("Goal", goalSchema);
 
 // Coach Pebble chat session. Each user can have N sessions (e.g. one per
-// "topic" or just one persistent thread). `expiresAt` carries the TTL —
+// "topic" or just one persistent thread). `expiresAt` carries the TTL,
 // MongoDB's TTL monitor sweeps every 60s and deletes documents whose
 // expiresAt is in the past. 30-day window matches the privacy policy
 // retention disclosure. Compound index on { userId, lastMessageAt } so
@@ -649,10 +680,10 @@ chatMessageSchema.index({ userId: 1, sessionId: 1, timestamp: 1 });
 const ChatSession = mongoose.model("ChatSession", chatSessionSchema);
 const ChatMessage = mongoose.model("ChatMessage", chatMessageSchema);
 
-// Phase 13.6 — audit collection for moderation safety events. Survives the
+// Phase 13.6, audit collection for moderation safety events. Survives the
 // 30-day chat TTL (1-year retention) so the PI/IRB has a paper trail of
 // when, how often, and what category of safety events occur in the field.
-// Crucially, this does NOT store the flagged user content — only the
+// Crucially, this does NOT store the flagged user content, only the
 // metadata (category list, action taken, timestamps). That lets the
 // research team monitor safety-event rates without violating retention
 // minimization (or letting concerning text linger in DB longer than the
@@ -711,7 +742,7 @@ function chatExpiresAt() {
 
 // Revoked-JWT blacklist. Logged-out tokens are inserted here (sha256 hash,
 // not the raw token) and looked up by authMiddleware.verifyToken to reject
-// further use. expiresAt is a TTL index — MongoDB auto-deletes entries
+// further use. expiresAt is a TTL index, MongoDB auto-deletes entries
 // the moment the underlying JWT would have expired anyway, so the table
 // stays bounded in size (one row per active session at most).
 const revokedTokenSchema = new mongoose.Schema({
@@ -721,17 +752,181 @@ const revokedTokenSchema = new mongoose.Schema({
 const RevokedToken = mongoose.model("RevokedToken", revokedTokenSchema);
 
 // ===========================================================================
-// Phase 13.7 — adult-notification on crisis flags. Per the IRB amendment
+// Phase 14, per-user economy state for Coach Pebble customization +
+// Plate Builder achievements. ONE row per user (uniqueness enforced by
+// userId index). Replaces the local-only SharedPreferences cache so a
+// kid logging in on a new device sees their coins, owned cosmetics,
+// achievements, and high scores. Local cache stays as offline + fast-
+// first-paint, server is the source of truth.
+//
+// Single-document model (vs per-event log) is fine because:
+//   - Volume is tiny (~1-2 KB per user max)
+//   - No multi-device concurrent writes typical for a kid (last-write-wins)
+//   - No analytics/audit need on individual coin transactions
+//
+// Cheating note: client could submit "coins: 999999". We accept this
+// because (a) no real money / IAP, (b) single-player only, (c) cheating
+// only affects the kid's own customization. A field whitelist + length
+// caps + regex on coachName below bound the damage so a malformed
+// payload can't blow up the DB or inject prompt-injection payloads
+// downstream.
+// ===========================================================================
+const economyStateSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      unique: true,
+      index: true,
+    },
+    coins: { type: Number, default: 0, min: 0, max: 1000000 },
+    coachName: {
+      type: String,
+      default: "Pebble",
+      // Same regex enforced at the request handler; this is a second
+      // line of defense if anything ever bypasses the API.
+      match: /^[A-Za-z0-9 ]{1,12}$/,
+    },
+    coachHasRenamed: { type: Boolean, default: false },
+    ownedSkins: { type: [String], default: [] },
+    ownedDecorations: { type: [String], default: [] },
+    ownedAccessories: { type: [String], default: [] },
+    equippedSkin: { type: String, default: "mouse" },
+    equippedDecoration: { type: String, default: "plain" },
+    equippedAccessory: { type: String, default: "none" },
+    // Per-behavior, per-day dedup map for daily-goal coin awards.
+    // Map key is behavior name ("activity"/"sleep"/"eating"/"screentime"),
+    // value is the ISO date string of last award.
+    lastGoalCoinDate: { type: Map, of: String, default: () => ({}) },
+    gameCoinsToday: { type: Number, default: 0, min: 0, max: 1000 },
+    gameCoinsDate: { type: String, default: "" },
+    // Plate Builder Challenge state.
+    plateBuilderHighScores: { type: Map, of: Number, default: () => ({}) },
+    plateBuilderAchievements: { type: [String], default: [] },
+    plateBuilderStats: { type: Map, of: Number, default: () => ({}) },
+    plateBuilderStreak: { type: Number, default: 0, min: 0, max: 10000 },
+    plateBuilderStreakDate: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+const EconomyState = mongoose.model("EconomyState", economyStateSchema);
+
+// Validates the inbound PUT /economy body. Returns { ok: true, doc } or
+// { ok: false, error }. Whitelisted fields only, length caps on every
+// list/map, regex on coachName, type checks throughout. The coachName
+// regex MATCHES `sanitizeCoachName` exactly so the same defense-in-depth
+// rules apply whether a coach name flows in via /chat or /economy.
+function validateEconomyPayload(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "body must be an object" };
+  }
+  const out = {};
+  // Number fields with sane caps.
+  const numFields = {
+    coins: { min: 0, max: 1000000 },
+    gameCoinsToday: { min: 0, max: 1000 },
+    plateBuilderStreak: { min: 0, max: 10000 },
+  };
+  for (const [k, range] of Object.entries(numFields)) {
+    if (k in raw) {
+      if (typeof raw[k] !== "number" || !Number.isFinite(raw[k])) {
+        return { ok: false, error: `${k} must be a finite number` };
+      }
+      if (raw[k] < range.min || raw[k] > range.max) {
+        return { ok: false, error: `${k} out of range` };
+      }
+      out[k] = raw[k];
+    }
+  }
+  // String fields.
+  if ("coachName" in raw) {
+    if (typeof raw.coachName !== "string" ||
+        !/^[A-Za-z0-9 ]{1,12}$/.test(raw.coachName.trim())) {
+      return { ok: false, error: "coachName invalid" };
+    }
+    out.coachName = raw.coachName.trim();
+  }
+  if ("coachHasRenamed" in raw) {
+    if (typeof raw.coachHasRenamed !== "boolean") {
+      return { ok: false, error: "coachHasRenamed must be boolean" };
+    }
+    out.coachHasRenamed = raw.coachHasRenamed;
+  }
+  for (const k of ["equippedSkin", "equippedDecoration", "equippedAccessory", "gameCoinsDate", "plateBuilderStreakDate"]) {
+    if (k in raw) {
+      if (typeof raw[k] !== "string" || raw[k].length > 32) {
+        return { ok: false, error: `${k} invalid` };
+      }
+      out[k] = raw[k];
+    }
+  }
+  // String-array fields. Cap at 60 entries per category, 32 chars per
+  // entry, prevents a malicious client from inflating the document.
+  for (const k of ["ownedSkins", "ownedDecorations", "ownedAccessories", "plateBuilderAchievements"]) {
+    if (k in raw) {
+      if (!Array.isArray(raw[k]) || raw[k].length > 60) {
+        return { ok: false, error: `${k} invalid` };
+      }
+      for (const v of raw[k]) {
+        if (typeof v !== "string" || v.length > 32) {
+          return { ok: false, error: `${k} entry invalid` };
+        }
+      }
+      // Dedup so client can't pad with repeats.
+      out[k] = Array.from(new Set(raw[k]));
+    }
+  }
+  // Map fields. Cap key count + key/value lengths.
+  const mapFields = {
+    lastGoalCoinDate: { valueType: "string", maxKey: 32, maxVal: 16, maxKeys: 20 },
+    plateBuilderHighScores: { valueType: "number", maxKey: 32, maxKeys: 20, maxVal: 100000 },
+    plateBuilderStats: { valueType: "number", maxKey: 64, maxKeys: 60, maxVal: 1000000 },
+  };
+  for (const [k, spec] of Object.entries(mapFields)) {
+    if (k in raw) {
+      if (!raw[k] || typeof raw[k] !== "object" || Array.isArray(raw[k])) {
+        return { ok: false, error: `${k} must be an object` };
+      }
+      const keys = Object.keys(raw[k]);
+      if (keys.length > spec.maxKeys) {
+        return { ok: false, error: `${k} too many keys` };
+      }
+      const validated = {};
+      for (const key of keys) {
+        if (key.length > spec.maxKey) {
+          return { ok: false, error: `${k} key too long` };
+        }
+        const val = raw[k][key];
+        if (spec.valueType === "string") {
+          if (typeof val !== "string" || val.length > spec.maxVal) {
+            return { ok: false, error: `${k} value invalid` };
+          }
+        } else if (spec.valueType === "number") {
+          if (typeof val !== "number" || !Number.isFinite(val) || val < 0 || val > spec.maxVal) {
+            return { ok: false, error: `${k} value invalid` };
+          }
+        }
+        validated[key] = val;
+      }
+      out[k] = validated;
+    }
+  }
+  return { ok: true, doc: out };
+}
+
+// ===========================================================================
+// Phase 13.7, adult-notification on crisis flags. Per the IRB amendment
 // design (irb_amendment_phase_13_7_draft.md): when SafetyEvent.action ===
 // "crisis_response" fires, enqueue a NotificationDispatch row. A daily 7 AM
 // Central cron batches all queued dispatches and sends ONE digest email per
 // counselor (currently a single COUNSELOR_EMAIL env var; per-school routing
-// is a Phase 13.7.1 follow-up). Email contains ZERO PII / message text —
+// is a Phase 13.7.1 follow-up). Email contains ZERO PII / message text,
 // only the timestamp + last-3-chars of student ID. Counselor calls the lab
 // to retrieve the thread.
 //
 // PI / PROFESSOR EXPLICITLY AUTHORIZED THIS BUILD AHEAD OF FORMAL IRB
-// AMENDMENT APPROVAL on 2026-04-27 ("i have permission" — see workdone.md
+// AMENDMENT APPROVAL on 2026-04-27 ("i have permission", see workdone.md
 // override entry of the same date). The cron is structurally safe even
 // pre-approval: with COUNSELOR_EMAIL unset, the cron NO-OPs and logs;
 // nothing is emailed. Operator must (a) configure COUNSELOR_EMAIL on
@@ -769,7 +964,7 @@ const notificationDispatchSchema = new mongoose.Schema({
   dispatchedAt: { type: Date },
   // Surface a brief failure note for operator triage; never includes PII.
   lastError: { type: String },
-  // 1-year retention matches SafetyEvent — same audit window.
+  // 1-year retention matches SafetyEvent, same audit window.
   expiresAt: { type: Date, required: true, expires: 0 },
 });
 notificationDispatchSchema.index({ status: 1, triggeredAt: 1 });
@@ -795,7 +990,7 @@ cron.schedule('0 0 * * *', async () => {
 
   try {
     const result = await SelectedItems.deleteMany({});
-    console.log(`Data reset successfully — deleted ${result.deletedCount} SelectedItems doc(s)`);
+    console.log(`Data reset successfully, deleted ${result.deletedCount} SelectedItems doc(s)`);
   } catch (error) {
     console.error('Error resetting data:', error);
   }
@@ -823,7 +1018,7 @@ app.post("/login", loginLimiter, async (req, res) => {
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     // Logging the email here was a COPPA data-minimization gap: server logs
     // (Render dashboard, downloaded log archives, third-party log shippers)
-    // would carry user emails. Log the user id instead — non-PII, sufficient
+    // would carry user emails. Log the user id instead, non-PII, sufficient
     // for tracing.
     console.log(`User ${user._id} logged in successfully.`);
     res.send(token);
@@ -1060,7 +1255,7 @@ app.post("/behaviors", authMiddleware.verifyToken, authMiddleware.attachUserId, 
       res.status(201).json(savedBehavior);
     }
   } catch (err) {
-    // Don't leak err.message to the client — Mongoose error strings include
+    // Don't leak err.message to the client, Mongoose error strings include
     // index names, schema field names, and duplicate-key details that map
     // straight to internal structure. Log on the server, return a generic
     // message to the caller.
@@ -1106,7 +1301,7 @@ app.get("/users", authMiddleware.verifyToken, authMiddleware.attachUserId, async
   }
 });
 
-// Account deletion endpoint — Apple App Store Guideline 5.1.1(v).
+// Account deletion endpoint, Apple App Store Guideline 5.1.1(v).
 // Hard-deletes the user document plus every collection that references the user.
 app.delete(
   "/user/:id",
@@ -1133,19 +1328,24 @@ app.delete(
         () => BehaviorInputs.deleteMany({ user: userId }),
         () => GoalInputs.deleteMany({ user: userId }),
         () => ChatbotResponse.deleteMany({ user: userId }),
-        // Phase 11 — Coach Pebble chat data is also user-linked and must
+        // Phase 11, Coach Pebble chat data is also user-linked and must
         // be wiped on account deletion (Apple 5.1.1(v) + COPPA right-to-
-        // delete). userId field on these docs (not user) — keep both
+        // delete). userId field on these docs (not user), keep both
         // collection names spelled out so search doesn't miss them.
         () => ChatSession.deleteMany({ userId }),
         () => ChatMessage.deleteMany({ userId }),
-        // Phase 13.6 — moderation audit events. Apple 5.1.1(v) +
+        // Phase 13.6, moderation audit events. Apple 5.1.1(v) +
         // COPPA right-to-delete trumps research audit retention: when
         // a user deletes their account, their safety events go too.
         () => SafetyEvent.deleteMany({ userId }),
-        // Phase 13.7 — adult-notification dispatch queue. Same Apple/COPPA
+        // Phase 13.7, adult-notification dispatch queue. Same Apple/COPPA
         // reasoning: account deletion wipes all derived records.
         () => NotificationDispatch.deleteMany({ userId }),
+        // Phase 14, Coach Pebble economy state (coins, owned cosmetics,
+        // achievements, high scores). Same Apple/COPPA right-to-delete
+        // trumps any retention preference: full account wipe = full
+        // economy wipe.
+        () => EconomyState.deleteMany({ userId }),
       ];
       for (const run of cascades) {
         try {
@@ -1190,7 +1390,7 @@ app.get("/dailyBehavior", authMiddleware.verifyToken, authMiddleware.attachUserI
     });
     res.status(200).json(behaviorToday);
   } catch (err) {
-    // Don't leak err.message to the client — Mongoose error strings include
+    // Don't leak err.message to the client, Mongoose error strings include
     // index names, schema field names, and duplicate-key details that map
     // straight to internal structure. Log on the server, return a generic
     // message to the caller.
@@ -1201,7 +1401,7 @@ app.get("/dailyBehavior", authMiddleware.verifyToken, authMiddleware.attachUserI
 
 // Surfaces the logged-in user's reflection text for the v1 Profile →
 // Saved Reflections screen. Tier 2: verifyToken + attachUserId. Reads
-// req._id only — no req.body.user / req.query.user — so there is no IDOR
+// req._id only, no req.body.user / req.query.user, so there is no IDOR
 // surface to misuse. Limited to the most recent 200 entries (defensive
 // upper bound; a chatty student over a year still fits comfortably).
 app.get(
@@ -1228,7 +1428,7 @@ app.get(
 
       res.status(200).json(docs);
     } catch (err) {
-      // Mongoose error strings can leak schema/index details — log on the
+      // Mongoose error strings can leak schema/index details, log on the
       // server, return a generic message to the caller (matches the rest
       // of the routes in this file).
       console.error("Reflections fetch error:", err);
@@ -1237,7 +1437,7 @@ app.get(
   }
 );
 
-// F7 — last-7-days summary for the "Show my recent goals" chat quick-prompt.
+// F7, last-7-days summary for the "Show my recent goals" chat quick-prompt.
 // Returns a small per-goalType aggregate the mobile client can format into a
 // chat seed, so Coach Pebble can give *informed* feedback based on real
 // behavior data rather than generic encouragement. PI authorized on
@@ -1255,7 +1455,7 @@ app.get(
 
       const docs = await Behavior.find({
         user: req._id,
-        // Tolerate legacy rows without dateToday — they get included
+        // Tolerate legacy rows without dateToday, they get included
         // (caller can still cap by length below).
         $or: [
           { dateToday: { $gte: cutoff } },
@@ -1294,7 +1494,7 @@ app.get(
         }
         // goalStatus is heterogeneous: helpers.dart sends a boolean, the
         // legacy seed/scripts sometimes write the string "true"/"Met". Be
-        // permissive — accept any truthy representation as "goal met".
+        // permissive, accept any truthy representation as "goal met".
         if (
           d.goalStatus === true ||
           d.goalStatus === "Met" ||
@@ -1372,7 +1572,7 @@ app.get("/journals-date/v1", authMiddleware.verifyToken, authMiddleware.attachUs
 
     res.status(200).json(Array.from(entryDatesForLast30Days));
   } catch (err) {
-    // Don't leak err.message to the client — Mongoose error strings include
+    // Don't leak err.message to the client, Mongoose error strings include
     // index names, schema field names, and duplicate-key details that map
     // straight to internal structure. Log on the server, return a generic
     // message to the caller.
@@ -1489,7 +1689,7 @@ app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, ch
     })
     // Without this .catch(), an OpenAI rejection (key exhausted, network
     // blip, rate limit, etc.) becomes an unhandled promise rejection and
-    // crashes the Node process — Render then restarts the dyno and clients
+    // crashes the Node process, Render then restarts the dyno and clients
     // see 502s in the meantime. Convert to a clean 500 so the dyno stays up.
     .catch((err) => {
       console.error("Chatbot OpenAI error: ", err && err.message ? err.message : err);
@@ -1556,7 +1756,7 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
       const chat_reply = response.choices[0].message.content;
       res.json({ chat_reply });
     })
-    // Same unhandled-rejection guard as /chatbot above — without this,
+    // Same unhandled-rejection guard as /chatbot above, without this,
     // OpenAI failure here crashes the dyno.
     .catch((err) => {
       console.error("Chatbot screentime OpenAI error: ", err && err.message ? err.message : err);
@@ -1571,7 +1771,7 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
 });
 
 // ===========================================================================
-// Coach Pebble chat — Phase 11.
+// Coach Pebble chat, Phase 11.
 // All routes are Tier 2: verifyToken + attachUserId, scoped to req._id only.
 // Sessions and messages are owned by the authenticated user; cross-user
 // reads/writes are 403'd at the route handler.
@@ -1587,7 +1787,7 @@ const MAX_CHAT_MESSAGE_LENGTH = 1000;
 const MAX_SESSION_TITLE_LENGTH = 80;
 
 // Create a new chat session (or reuse the user's most recent one if it was
-// touched in the last hour — keeps the typical "open chat → keep talking"
+// touched in the last hour, keeps the typical "open chat → keep talking"
 // flow on a single thread instead of fragmenting into many empty sessions).
 app.post(
   "/chat/sessions",
@@ -1612,9 +1812,14 @@ app.post(
         });
       }
 
+      // Phase 14: title the new session with the user's chosen coach
+      // name. Sanitizer rejects anything outside ^[A-Za-z0-9 ]{1,12}$ so
+      // the title can't sneak HTML or prompt-injection payloads into
+      // anywhere later code displays it.
+      const coachNameForTitle = sanitizeCoachName(req.body && req.body.coachName);
       const session = await ChatSession.create({
         userId: req._id,
-        title: "Chat with Coach Pebble",
+        title: `Chat with Coach ${coachNameForTitle}`,
         expiresAt: chatExpiresAt(),
       });
       return res.status(201).json({
@@ -1663,7 +1868,7 @@ app.post(
           .send("Forbidden: cannot write to another user's session.");
       }
 
-      // Phase 13.6 — moderate the USER message BEFORE we let it hit
+      // Phase 13.6, moderate the USER message BEFORE we let it hit
       // gpt-4o-mini. Crisis-category flags (self-harm family) get the
       // CRISIS_RESPONSE path with real hotline numbers; other flagged
       // categories (violence/sexual/hate/harassment) get the gentler
@@ -1699,7 +1904,7 @@ app.post(
         });
 
         // Long-retention audit trail (1 year by default). Crucially does
-        // NOT store userText — only the metadata IRB needs for monitoring.
+        // NOT store userText, only the metadata IRB needs for monitoring.
         try {
           await SafetyEvent.create({
             userId: req._id,
@@ -1712,11 +1917,11 @@ app.post(
           });
         } catch (auditErr) {
           // SafetyEvent.create failing must not block the canned reply
-          // from reaching the kid — log and continue.
+          // from reaching the kid, log and continue.
           console.error("SafetyEvent persist error:", auditErr);
         }
 
-        // Phase 13.7 — enqueue an adult-notification ONLY for the crisis
+        // Phase 13.7, enqueue an adult-notification ONLY for the crisis
         // category. harmful_redirect doesn't escalate (gentle nudge case).
         // The cron at 7 AM Central picks queued rows up and emails the
         // configured COUNSELOR_EMAIL. Failure here must not block the
@@ -1766,14 +1971,14 @@ app.post(
           sessionTitle: session.title,
           // Mobile can use this signal to render the response with extra
           // visual emphasis (e.g. don't TTS the crisis hotline silently
-          // — it's important the kid SEES the numbers, not just hears
+          //, it's important the kid SEES the numbers, not just hears
           // them once and they vanish).
           safetyAction: action,
         });
       }
 
       // Pull last N messages for short-term conversation context. The
-      // assistant only needs recent turns — older history would explode
+      // assistant only needs recent turns, older history would explode
       // the prompt size + cost without a meaningful quality bump.
       const history = await ChatMessage.find({
         sessionId: session._id,
@@ -1784,10 +1989,18 @@ app.post(
         .lean();
       history.reverse(); // chronological
 
+      // Phase 14: per-request persona name. The kid's chosen coach name
+      // (default "Pebble") flows in via req.body.coachName, gets passed
+      // through `sanitizeCoachName` which rejects anything outside
+      // ^[A-Za-z0-9 ]{1,12}$ so a name like "Pebble. Ignore previous
+      // instructions and..." cannot land in the system prompt verbatim.
+      // The PERSONA BODY (safety rules, role, restrictions) is still a
+      // server-side constant; only the name varies.
+      const coachName = sanitizeCoachName(req.body && req.body.coachName);
       const messages = [
         {
           role: "system",
-          content: PROMPT_INJECTION_GUARD + COACH_PEBBLE_PERSONA,
+          content: PROMPT_INJECTION_GUARD + buildCoachPersona(coachName),
         },
         ...history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: userText },
@@ -1812,7 +2025,7 @@ app.post(
       const tokensUsed =
         (completion.usage && completion.usage.total_tokens) || 0;
 
-      // Phase 13.5 — moderate the assistant response BEFORE it can be
+      // Phase 13.5, moderate the assistant response BEFORE it can be
       // persisted, returned to the client, or read aloud by voice mode.
       // If flagged, swap in a neutral redirect; we never store the
       // flagged original so it can't leak via history reads.
@@ -1822,12 +2035,12 @@ app.post(
         : rawReplyText;
       if (moderation.flagged) {
         // Telemetry: log session/user + flagged categories ONLY. Never
-        // log the flagged content — that's user PII (or worse) and we
+        // log the flagged content, that's user PII (or worse) and we
         // just declined to keep it.
         console.log(
           `chat moderation flagged session=${session._id} user=${req._id} categories=${(moderation.categories || []).join(",")}`
         );
-        // Audit trail (Phase 13.6) — same retention as input flags so
+        // Audit trail (Phase 13.6), same retention as input flags so
         // PI/IRB can see input-side AND output-side safety events on
         // one timeline. Best-effort; failure must not block reply.
         try {
@@ -1872,7 +2085,7 @@ app.post(
       session.messageCount += 2;
       session.expiresAt = expiresAt;
       // First user message also titles the session if it still has the
-      // default title — gives the history list something readable without
+      // default title, gives the history list something readable without
       // an extra OpenAI call.
       if (
         session.title === "Chat with Coach Pebble" &&
@@ -1886,7 +2099,7 @@ app.post(
       }
       await session.save();
 
-      // Log only non-PII telemetry. Never log message content — it's user
+      // Log only non-PII telemetry. Never log message content, it's user
       // text from a minor.
       console.log(
         `chat msg ok session=${session._id} user=${req._id} tokens=${tokensUsed}`
@@ -2011,7 +2224,97 @@ app.delete(
   }
 );
 
-// Liveness probe. No auth, no DB roundtrip — just confirms the process is
+// ===========================================================================
+// Phase 14, GET / PUT /economy. Server-side persistence for the Coach
+// Pebble customization economy. Replaces the previous local-only
+// SharedPreferences cache so a kid logging in on a new device sees the
+// same coins / pets / badges. Local cache stays on the client as
+// offline + first-paint-fast; server is the source of truth.
+//
+// Security:
+//   - Auth-gated (verifyToken + attachUserId). Tier 2 invariant.
+//   - IDOR-safe: doc keyed by req._id from the JWT, NEVER from req.body.
+//   - Schema-validated: validateEconomyPayload() whitelists every field
+//     and bounds list / map sizes. No path for a malicious client to
+//     inflate the document or inject prompt-injection payloads via
+//     coachName.
+//   - No PII: cosmetic ids, coin counts, achievement ids, 12-char coach
+//     name. Nothing here is identifiable per COPPA.
+// ===========================================================================
+app.get(
+  "/economy",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      let doc = await EconomyState.findOne({ userId: req._id }).lean();
+      if (!doc) {
+        // No prior state, return defaults so the client can hydrate
+        // identically on first sync. Don't write a row yet, the next
+        // PUT will upsert it.
+        doc = {
+          userId: req._id,
+          coins: 0,
+          coachName: "Pebble",
+          coachHasRenamed: false,
+          ownedSkins: [],
+          ownedDecorations: [],
+          ownedAccessories: [],
+          equippedSkin: "mouse",
+          equippedDecoration: "plain",
+          equippedAccessory: "none",
+          lastGoalCoinDate: {},
+          gameCoinsToday: 0,
+          gameCoinsDate: "",
+          plateBuilderHighScores: {},
+          plateBuilderAchievements: [],
+          plateBuilderStats: {},
+          plateBuilderStreak: 0,
+          plateBuilderStreakDate: "",
+        };
+      } else {
+        // Mongoose Map fields serialize as plain objects via .lean(),
+        // but null-default if a field was never set. Normalize so the
+        // client sees `{}` instead of `null` and never has to defensive-
+        // null-check on hydrate.
+        doc.lastGoalCoinDate = doc.lastGoalCoinDate || {};
+        doc.plateBuilderHighScores = doc.plateBuilderHighScores || {};
+        doc.plateBuilderStats = doc.plateBuilderStats || {};
+      }
+      return res.status(200).json(doc);
+    } catch (err) {
+      console.error("Economy GET error:", err);
+      return res.status(500).json({ message: "Could not load economy state." });
+    }
+  }
+);
+
+app.put(
+  "/economy",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const v = validateEconomyPayload(req.body);
+      if (!v.ok) {
+        return res.status(400).json({ message: v.error });
+      }
+      // upsert by userId. `$set` only the validated fields so client
+      // omitting a key doesn't blow away existing state.
+      await EconomyState.findOneAndUpdate(
+        { userId: req._id },
+        { $set: { ...v.doc, userId: req._id } },
+        { upsert: true, setDefaultsOnInsert: true, runValidators: true }
+      );
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error("Economy PUT error:", err);
+      return res.status(500).json({ message: "Could not save economy state." });
+    }
+  }
+);
+
+// Liveness probe. No auth, no DB roundtrip, just confirms the process is
 // running and responding. Hook this into Render's health checks and any
 // external uptime monitor (UptimeRobot, etc.) so the moment the dyno goes
 // down we get paged instead of finding out from a user.
@@ -2020,7 +2323,7 @@ app.get("/health", (_req, res) => {
 });
 
 // ===========================================================================
-// Phase 13.7 — daily 7 AM Central counselor digest cron.
+// Phase 13.7, daily 7 AM Central counselor digest cron.
 //
 // Picks up all NotificationDispatch rows with status="queued" and action=
 // "crisis_response", batches them into ONE email per dispatch run, sends
@@ -2028,8 +2331,8 @@ app.get("/health", (_req, res) => {
 // verification codes), marks each row "dispatched" or "failed" with a
 // brief lastError. Runs even if no rows exist (cheap no-op query).
 //
-// HARD GATES — NOTHING IS EMAILED unless ALL of these are true:
-//   1. process.env.COUNSELOR_EMAIL is set (operator config — has to be
+// HARD GATES, NOTHING IS EMAILED unless ALL of these are true:
+//   1. process.env.COUNSELOR_EMAIL is set (operator config, has to be
 //      explicitly added to Render env vars; absence = silent no-op)
 //   2. process.env.COUNSELOR_DISPATCH_ENABLED === "true" (a second
 //      kill-switch so even with the email var set, dispatch stays off
@@ -2041,11 +2344,11 @@ app.get("/health", (_req, res) => {
 // but the dual-gate pattern preserves the actual operational requirement
 // that no email goes out until the IRB amendment lands.
 //
-// Email body contains ZERO PII / message text — only:
+// Email body contains ZERO PII / message text, only:
 //   - timestamp (Central)
 //   - last 3 chars of student id (so counselor can call lab to retrieve
 //     full thread without PII traveling over email)
-// Counselor calls the lab for thread review — by design.
+// Counselor calls the lab for thread review, by design.
 // ===========================================================================
 async function runCounselorDispatch() {
   const recipient = process.env.COUNSELOR_EMAIL;
@@ -2057,7 +2360,7 @@ async function runCounselorDispatch() {
       `recipientSet=${!!recipient} enabled=${enabled}`
   );
 
-  // Find queued crisis dispatches regardless of gate state — so when
+  // Find queued crisis dispatches regardless of gate state, so when
   // gates open, the backlog flushes immediately rather than starting
   // from "now."
   let queued;
@@ -2084,7 +2387,7 @@ async function runCounselorDispatch() {
   if (!recipient || !enabled) {
     console.log(
       `[counselor-dispatch] ${queued.length} queued event(s) but ` +
-        `gates closed — marking skipped_no_recipient (no email sent).`
+        `gates closed, marking skipped_no_recipient (no email sent).`
     );
     try {
       await NotificationDispatch.updateMany(
@@ -2107,7 +2410,7 @@ async function runCounselorDispatch() {
     return;
   }
 
-  // Both gates open — build the digest. Per IRB amendment design: NO
+  // Both gates open, build the digest. Per IRB amendment design: NO
   // user content, NO email addresses, NO names. Just timestamp + last
   // 3 chars of userId so the counselor can call the lab to retrieve
   // the thread.
@@ -2118,7 +2421,7 @@ async function runCounselorDispatch() {
     const idTail = String(d.userId).slice(-3);
     return `  • ${central}  student#…${idTail}  category: crisis`;
   });
-  const subject = `ProudMe daily safety digest — ${queued.length} crisis flag(s)`;
+  const subject = `ProudMe daily safety digest, ${queued.length} crisis flag(s)`;
   const text =
     `This is the daily ProudMe safety digest from the LSU Pedagogical ` +
     `Kinesiology Lab (PI: Project ProudMe).\n\n` +
@@ -2131,7 +2434,7 @@ async function runCounselorDispatch() {
     `with the timestamp and student tail below. NO message text or ` +
     `student email is included in this digest by design.\n\n` +
     `Flagged events (Central time):\n${lines.join("\n")}\n\n` +
-    `— ProudMe automated safety dispatcher (Phase 13.7)\n` +
+    `, ProudMe automated safety dispatcher (Phase 13.7)\n` +
     `Lab contact: pklab@projectproudme.com`;
 
   const msg = {
@@ -2182,7 +2485,7 @@ console.log(
 // Process-level safety net. If a future code path drops a rejected promise
 // (the way /chatbot did before its .catch was added), we'd rather log + keep
 // serving than crash the dyno and 502 every in-flight request. Node 15+
-// default behavior crashes on unhandledRejection — opt out of that.
+// default behavior crashes on unhandledRejection, opt out of that.
 process.on("unhandledRejection", (reason) => {
   console.error(
     "Unhandled promise rejection (NOT crashing):",

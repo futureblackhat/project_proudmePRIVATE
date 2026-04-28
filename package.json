@@ -1,7 +1,7 @@
 {
   "name": "project-proudme",
   "version": "1.0.0",
-  "description": "Backend for the Project ProudMe research app — adolescent obesity prevention intervention.",
+  "description": "Backend for the Project ProudMe research app, adolescent obesity prevention intervention.",
   "main": "./server/server.js",
   "scripts": {
     "start": "cd ./server && node server.js",
