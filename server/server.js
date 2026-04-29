@@ -415,9 +415,24 @@ app.use(helmet());
 // else gets rejected, closes the browser-side CSRF/embed-our-API-in-a-rogue-
 // site risk class. Requests with no Origin header (curl, native mobile,
 // server-to-server) pass through.
+//
+// Round 17, added private-LAN ranges so a developer can test Flutter web
+// from a phone on the same WiFi (laptop runs `flutter run -d web-server
+// --web-hostname=0.0.0.0` and the phone hits http://192.168.x.x:8080).
+// Threat model unchanged in practice, an attacker would need a victim on
+// the same physical LAN visiting their malicious site, AND the API itself
+// still requires a valid JWT for any authenticated action, AND every
+// sensitive endpoint is rate-limited (registerLimiter, daily token caps,
+// /support/contact 5/hr cap). CORS protects browsers from cross-origin
+// reads, not the API surface, so widening to LAN does not materially
+// change the threat model.
 const allowedOriginPatterns = [
   /^http:\/\/localhost(:\d+)?$/,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+  // RFC 1918 private LAN ranges, browser-only dev access from same WiFi.
+  /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}(:\d+)?$/,
+  /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$/,
+  /^http:\/\/172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}(:\d+)?$/,
 ];
 app.use(
   cors({
