@@ -14,6 +14,7 @@ const moment = require("moment-timezone");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const validator = require("validator");
+const { isDisposableEmail } = require("./disposable_email_domains");
 
 // Password policy: min 8 chars, at least one letter, at least one digit.
 // Enforced server-side (authoritative) and mirrored client-side (UX).
@@ -94,15 +95,39 @@ const PROMPT_INJECTION_GUARD =
 // Length cap is 75 tokens to match the existing /chatbot ceiling and
 // keep voice TTS responses short.
 function buildCoachPersona(coachName) {
+  // Round 17 #10: tone refinement. The user QA pass surfaced two needs:
+  // (1) when a kid expresses an emotion (sad, frustrated, anxious), the
+  // buddy must comfort first + ask one short follow-up question, NOT
+  // jump straight to suggestions; and (2) tighter topic boundaries with
+  // an explicit refuse-and-redirect on adult/dangerous topics. The
+  // indirect-mention rule lets the buddy talk about games/school/
+  // friends but only by tying back to one of the four health pillars
+  // (sleep / activity / eating / screen time). Kept under 75 tokens
+  // since brevity is what the user explicitly asked for ("brief, not
+  // too brief"); the comfort-then-ask flow comfortably fits that cap.
   return (
-    `You are Coach ${coachName}, a friendly AI health buddy for middle-school ` +
-    "students (grades 5-9). Keep responses warm, age-appropriate, and " +
-    "under 75 tokens. Focus on physical activity, sleep, screen time, and " +
-    "eating fruits + vegetables. Never give medical advice; for serious " +
-    "health concerns suggest the student talk to a parent, school nurse, " +
-    "or doctor. Never ask for personal information (real name, school, " +
-    "phone, address). Do not roleplay, do not output code, do not produce " +
-    "content unrelated to healthy habits. "
+    `You are ${coachName}, a friendly AI buddy for middle-school students ` +
+    "(grades 5-9). Keep responses warm, age-appropriate, and under 75 tokens.\n\n" +
+    "EMOTIONAL FIRST RESPONSE: If the student expresses sadness, frustration, " +
+    'anxiety, loneliness, or any tough feeling, your FIRST sentence must ' +
+    'acknowledge the feeling warmly (for example "That sounds really hard"). ' +
+    "Then ask ONE short follow-up question about what's going on. Only AFTER " +
+    "they share more should you offer a small, gentle suggestion. Never lead " +
+    "with advice when emotion is present.\n\n" +
+    "TOPIC FOCUS: stay on physical activity, sleep, screen time, and eating " +
+    "fruits + vegetables. For indirect mentions (games, school, friends, " +
+    "hobbies), acknowledge briefly then gently tie back to a health pillar " +
+    'with one practical tie-in (for example "Minecraft is fine in moderation, ' +
+    'just give your eyes a 20-minute break and grab some outdoor time after"). ' +
+    "Never call a hobby bad or shame the kid for it.\n\n" +
+    "REFUSE AND REDIRECT: never discuss drugs, alcohol, vaping, suicide, " +
+    "self-harm, violence, weapons, sexual content, romantic relationships, " +
+    "dating, body-image criticism, calorie counting, or dieting. If asked, " +
+    'reply once with "That\'s an important question for a parent, school nurse, ' +
+    'or doctor" and pivot back to a health pillar.\n\n' +
+    "NEVER: give medical advice, ask for personal information (real name, " +
+    "school, phone, address), roleplay, output code, or produce content " +
+    "unrelated to healthy habits. "
   );
 }
 
@@ -319,6 +344,46 @@ const sendCodeLimiter = rateLimit({
   message: { error: "Too many code requests. Please wait before trying again." },
 });
 
+// Register: 5 accounts / hour / IP. Round 15 hardening, the original
+// /register endpoint had no rate limit at all, so a single attacker IP
+// (or a botnet of N IPs) could mass-create accounts to bypass per-user
+// AI rate limits. Each fresh account gets a 20/hr chatbot + 50/hr chat
+// quota; without a register cap, those quotas are effectively unbounded.
+//
+// 5/hr/IP is generous for school/family WiFi (multiple kids can register
+// in sequence) but blocks botnet-style mass creation. Pairs with the
+// disposable-email blocklist + age validation below to make this a
+// layered defense. Keyed by IP because there's no JWT yet at register
+// time. Tunable.
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+  message: {
+    error: "Too many registration attempts from this network. Try again in an hour.",
+  },
+});
+
+// Support contact form: 5 messages / hour / authenticated user. Keyed by
+// req._id so a single attacker on shared WiFi can't spam by hopping IPs.
+// Pairs with the auth requirement (no anonymous submission) + 10-2000
+// char length bounds + plain-text-only payload (no HTML, no header
+// injection) to bound the abuse surface to "annoy the support inbox" at
+// worst. NOT keyed by IP; if IP varies (mobile data → wifi) the per-user
+// counter still applies.
+const supportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req._id || req.ip,
+  message: {
+    error: "You've sent a few messages already. Try again in an hour.",
+  },
+});
+
 const app = express();
 // Render injects PORT into the environment; fall back to 3001 for local dev.
 // Hard-coding 3001 used to mean Render had to bridge port 3001 → its public
@@ -417,6 +482,27 @@ const userSchema = new mongoose.Schema({
   birthYear: { type: String, required: true },
   gradeLevel: { type: String, required: true },
   gender: { type: String, required: true },
+  // Round 16 Phase 6 #24: optional anatomy fields. Bounded so a tampered
+  // client can't flip these into Number.MAX or negatives. Both are
+  // OPTIONAL (research participants self-volunteer; "approximate is
+  // fine" per the user's call). Min/max are wide enough to cover any
+  // realistic grade 5-9 kid plus margin for self-reporting fuzz, but
+  // tight enough to reject obvious junk (-1, 9999, etc).
+  // - heightCm: 60 cm (~kindergartener floor) to 250 cm (~tallest
+  //   recorded human plus headroom). Skipping a unit-aware schema
+  //   on purpose; client always sends cm even when the user enters
+  //   feet/inches in the UI (conversion happens in the form).
+  // - weightKg: 10 kg (~light kindergartener) to 300 kg (medical edge).
+  heightCm: { type: Number, min: 60, max: 250, default: null },
+  weightKg: { type: Number, min: 10, max: 300, default: null },
+  // Round 17 #9: parental-consent affirmation captured at sign-up.
+  // Required at /register going forward; existing accounts default to
+  // null (legacy users predate this gate; the LSU IRB has the original
+  // paper consent forms, no retroactive in-app re-affirmation needed).
+  // Persisted with timestamp for audit; readable by support tooling
+  // for IRB inquiries; never echoed back to the client.
+  parentalConsentGiven: { type: Boolean, default: null },
+  parentalConsentAt: { type: Date, default: null },
   isVerifiedEmail: { type: Boolean, default: true },
   verificationCode: { type: String, select: false },
 });
@@ -639,7 +725,11 @@ const chatSessionSchema = new mongoose.Schema({
     required: true,
     index: true,
   },
-  title: { type: String, default: "Chat with Coach Pebble" },
+  // Round 17: default chat title uses the "your buddy" framing instead
+  // of the legacy Coach Pebble copy. The auto-rename branch below uses
+  // the FIRST_MESSAGE_TITLE_DEFAULTS allowlist so existing rows with
+  // older defaults still get renamed on first user reply.
+  title: { type: String, default: "Chat with your buddy" },
   createdAt: { type: Date, default: Date.now },
   lastMessageAt: { type: Date, default: Date.now },
   messageCount: { type: Number, default: 0 },
@@ -807,10 +897,163 @@ const economyStateSchema = new mongoose.Schema(
     plateBuilderStats: { type: Map, of: Number, default: () => ({}) },
     plateBuilderStreak: { type: Number, default: 0, min: 0, max: 10000 },
     plateBuilderStreakDate: { type: String, default: "" },
+    // Round 16 Phase 4 #1: dedup the +25 daily-challenge bonus per
+    // calendar day (mirrors the existing sleepyPebbleDailyChallengeDate
+    // field). Without this a tampered client could replay the daily
+    // for the bonus repeatedly. 32-char string cap matches the other
+    // date fields in `validateEconomyPayload`.
+    plateBuilderDailyChallengeDate: { type: String, default: "" },
+    // Round 15, Sleepy Pebble flappy-bird-style sleep-hygiene game state.
+    // Same shape as Plate Builder so the two games can coexist in the
+    // same EconomyState doc with no migration. Bounds match the validate
+    // helper below; no field can hold a payload large enough to make the
+    // whole doc cross the typical Mongoose 16 MB limit.
+    sleepyPebbleHighScore: { type: Number, default: 0, min: 0, max: 999999 },
+    sleepyPebbleAchievements: { type: [String], default: [] },
+    sleepyPebbleStats: { type: Map, of: Number, default: () => ({}) },
+    sleepyPebbleStreak: { type: Number, default: 0, min: 0, max: 10000 },
+    sleepyPebbleStreakDate: { type: String, default: "" },
+    sleepyPebbleEnvironments: { type: [String], default: [] },
+    sleepyPebbleDailyChallengeDate: { type: String, default: "" },
+    sleepyPebbleTriviaStats: { type: Map, of: Number, default: () => ({}) },
+    // Round 16 Phase 7 #40: app-use badges. Same shape as the per-game
+    // sets so the validator/whitelist below can reuse the existing
+    // bounds-pattern. appUseStats counters use date-as-int encoding
+    // (YYYYMMDD) for last-log/streak-date/today-date so the map stays
+    // typed-Number and avoids a parallel string-map handler.
+    appUseAchievements: { type: [String], default: [] },
+    appUseStats: { type: Map, of: Number, default: () => ({}) },
   },
   { timestamps: true }
 );
 const EconomyState = mongoose.model("EconomyState", economyStateSchema);
+
+// ===========================================================================
+// Round 15, daily per-user OpenAI token cap. The existing chatLimiter
+// (50/hr) bounds REQUEST RATE but not REQUEST COST: a kid can fire 50
+// requests/hour every hour all day long and still hit ~10K tokens before
+// any per-user ceiling kicks in. With chatbotLimiter (20/hr) AND chatLimiter
+// (50/hr) running in parallel, the worst case per user per day is roughly
+// (75 max_tokens × 50/hr × 24 hr) ≈ 90K tokens, which at gpt-4o-mini's
+// $0.6/1M output rate is ~$0.05/user/day. Multiplied across N pilot users,
+// no ceiling = no budget guarantee.
+//
+// This model gives the chat handler a place to atomically record + check
+// today's cumulative tokens. If totalTokens >= DAILY_USER_TOKEN_CAP, the
+// handler short-circuits with a 429 + kid-friendly "you've used today's
+// coach time" message, NOT a "you're banned" tone (Apple kids-app review
+// cares about gentle UX).
+//
+// Cost-cap math: 10K tokens × N users × $0.0006/1K total ≈ $0.006/user/day.
+// 1000 active users worst case = $6/day = $180/month worst case. Predictable,
+// capped, sleep-easy.
+//
+// Index: unique compound (userId, date) so each (user, day) pair has one
+// row and atomic $inc-with-upsert is safe under concurrent requests.
+//
+// Retention: 1-year TTL via expiresAt is overkill for a usage counter,
+// but matches the SafetyEvent retention so anyone auditing "what did this
+// user do on this day" has both timelines side by side. 30 days would
+// also be fine.
+// ===========================================================================
+const DAILY_USER_TOKEN_CAP = parseInt(
+  process.env.DAILY_USER_TOKEN_CAP || "10000",
+  10
+);
+// Aggregate threshold for the WARN-level spend log line. When today's
+// total tokens across ALL users crosses this, we log a [ai-spend WARN]
+// line that ops should see in Render's log dashboard. No automatic
+// action; just visibility for manual triage. Default tuned to ~$0.60/day
+// for gpt-4o-mini, low enough to alarm before the bill bites but high
+// enough that a busy pilot day doesn't cry wolf.
+const DAILY_SPEND_WARN_TOKENS = parseInt(
+  process.env.DAILY_SPEND_WARN_TOKENS || "1000000",
+  10
+);
+
+const dailyAiUsageSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  // ISO YYYY-MM-DD UTC. Day-of-month rotation is cheaper than a real TTL
+  // sweep on every check. Counter zeros itself by virtue of the new date
+  // having no row yet (upsert + $inc creates a fresh row at midnight UTC).
+  date: { type: String, required: true, index: true },
+  totalTokens: { type: Number, default: 0, min: 0 },
+  // 1-year TTL so historical usage rows don't accumulate indefinitely.
+  expiresAt: { type: Date, required: true, expires: 0 },
+});
+dailyAiUsageSchema.index({ userId: 1, date: 1 }, { unique: true });
+const DailyAiUsage = mongoose.model("DailyAiUsage", dailyAiUsageSchema);
+
+// UTC date for the daily-cap rollover. Using UTC (not Central) so a kid
+// in any timezone hits the same cap at the same moment; the alternative
+// (Central rollover) would let an EST kid drain their cap by 8 PM and a
+// PST kid by 5 PM, which feels arbitrary. Server clock is UTC on Render.
+function todayIsoUtc() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
+// 1-year TTL on usage rows (matches SafetyEvent retention).
+function dailyAiUsageExpiresAt() {
+  const d = new Date();
+  d.setDate(d.getDate() + 365);
+  return d;
+}
+
+// Returns true if the user is over the daily cap. Performs a read-only
+// query, no mutation; use [recordDailyAiUsageTokens] AFTER OpenAI returns
+// to atomically log the actual usage.
+async function isUserOverDailyAiCap(userId) {
+  const row = await DailyAiUsage.findOne({
+    userId,
+    date: todayIsoUtc(),
+  }).lean();
+  if (!row) return false;
+  return (row.totalTokens || 0) >= DAILY_USER_TOKEN_CAP;
+}
+
+// Atomic upsert + $inc on the user's row for today. Also computes the
+// post-increment global daily total so we can log spend-WARN lines.
+async function recordDailyAiUsageTokens(userId, tokens) {
+  if (!tokens || tokens <= 0) return;
+  const date = todayIsoUtc();
+  await DailyAiUsage.findOneAndUpdate(
+    { userId, date },
+    {
+      $inc: { totalTokens: tokens },
+      $setOnInsert: { expiresAt: dailyAiUsageExpiresAt() },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+  // Cheap aggregation. Runs once per chat call (already chargeable
+  // latency); doesn't touch hot path. If this becomes a perf concern,
+  // cache the daily total in a separate single-doc collection.
+  try {
+    const agg = await DailyAiUsage.aggregate([
+      { $match: { date } },
+      { $group: { _id: null, total: { $sum: "$totalTokens" } } },
+    ]);
+    const dailyTotal = (agg[0] && agg[0].total) || 0;
+    if (dailyTotal >= DAILY_SPEND_WARN_TOKENS) {
+      console.log(
+        `[ai-spend WARN] daily total ${dailyTotal} tokens >= warn threshold ${DAILY_SPEND_WARN_TOKENS} (cap-per-user=${DAILY_USER_TOKEN_CAP})`
+      );
+    } else {
+      console.log(
+        `[ai-spend] user=${userId} +${tokens} dailyTotal=${dailyTotal}`
+      );
+    }
+  } catch (aggErr) {
+    // Spend log is observability, not load-bearing. Don't fail the chat
+    // call if the aggregate query glitches.
+    console.error("[ai-spend] aggregate failed:", aggErr && aggErr.message);
+  }
+}
 
 // Validates the inbound PUT /economy body. Returns { ok: true, doc } or
 // { ok: false, error }. Whitelisted fields only, length caps on every
@@ -827,6 +1070,11 @@ function validateEconomyPayload(raw) {
     coins: { min: 0, max: 1000000 },
     gameCoinsToday: { min: 0, max: 1000 },
     plateBuilderStreak: { min: 0, max: 10000 },
+    // Round 15, Sleepy Pebble fields. Same bounds rationale as Plate
+    // Builder: high enough to never cap a real player, low enough to
+    // reject obviously-tampered payloads (someone injecting Number.MAX).
+    sleepyPebbleHighScore: { min: 0, max: 999999 },
+    sleepyPebbleStreak: { min: 0, max: 10000 },
   };
   for (const [k, range] of Object.entries(numFields)) {
     if (k in raw) {
@@ -853,7 +1101,15 @@ function validateEconomyPayload(raw) {
     }
     out.coachHasRenamed = raw.coachHasRenamed;
   }
-  for (const k of ["equippedSkin", "equippedDecoration", "equippedAccessory", "gameCoinsDate", "plateBuilderStreakDate"]) {
+  for (const k of [
+    "equippedSkin", "equippedDecoration", "equippedAccessory",
+    "gameCoinsDate", "plateBuilderStreakDate",
+    // Round 16 Phase 4 #1: Plate Builder daily-challenge dedup date.
+    "plateBuilderDailyChallengeDate",
+    // Round 15, Sleepy Pebble. Date strings (YYYY-MM-DD), 32 char cap is
+    // generous, plenty of headroom but still bounds the doc.
+    "sleepyPebbleStreakDate", "sleepyPebbleDailyChallengeDate",
+  ]) {
     if (k in raw) {
       if (typeof raw[k] !== "string" || raw[k].length > 32) {
         return { ok: false, error: `${k} invalid` };
@@ -863,9 +1119,20 @@ function validateEconomyPayload(raw) {
   }
   // String-array fields. Cap at 60 entries per category, 32 chars per
   // entry, prevents a malicious client from inflating the document.
-  for (const k of ["ownedSkins", "ownedDecorations", "ownedAccessories", "plateBuilderAchievements"]) {
+  // sleepyPebbleEnvironments capped at 10, only 4 ship today but keep
+  // headroom. Achievement set capped at 60 to match Plate Builder.
+  for (const k of [
+    "ownedSkins", "ownedDecorations", "ownedAccessories",
+    "plateBuilderAchievements",
+    "sleepyPebbleAchievements",
+    "sleepyPebbleEnvironments",
+    // Round 16 Phase 7 #40: app-use badge ids. Same 60-element cap +
+    // 32-char-per-entry as the other achievement arrays.
+    "appUseAchievements",
+  ]) {
     if (k in raw) {
-      if (!Array.isArray(raw[k]) || raw[k].length > 60) {
+      const cap = k === "sleepyPebbleEnvironments" ? 10 : 60;
+      if (!Array.isArray(raw[k]) || raw[k].length > cap) {
         return { ok: false, error: `${k} invalid` };
       }
       for (const v of raw[k]) {
@@ -882,6 +1149,15 @@ function validateEconomyPayload(raw) {
     lastGoalCoinDate: { valueType: "string", maxKey: 32, maxVal: 16, maxKeys: 20 },
     plateBuilderHighScores: { valueType: "number", maxKey: 32, maxKeys: 20, maxVal: 100000 },
     plateBuilderStats: { valueType: "number", maxKey: 64, maxKeys: 60, maxVal: 1000000 },
+    // Round 15, Sleepy Pebble counters. Same bounds as Plate Builder
+    // stats; both games will write similar counter shapes.
+    sleepyPebbleStats: { valueType: "number", maxKey: 64, maxKeys: 60, maxVal: 1000000 },
+    sleepyPebbleTriviaStats: { valueType: "number", maxKey: 32, maxKeys: 20, maxVal: 100000 },
+    // Round 16 Phase 7 #40: app-use stat counters. Some counters carry
+    // YYYYMMDD-as-int values (max ~21000000 for year 2100), so the
+    // maxVal needs headroom over the per-game stats; 30000000 is a
+    // safe ceiling for any plausible date int + lifetime counters.
+    appUseStats: { valueType: "number", maxKey: 64, maxKeys: 30, maxVal: 30000000 },
   };
   for (const [k, spec] of Object.entries(mapFields)) {
     if (k in raw) {
@@ -1028,12 +1304,100 @@ app.post("/login", loginLimiter, async (req, res) => {
   }
 });
 
-// Registration endpoint
-app.post("/register", async (req, res) => {
-  const { email, password, confirmPassword, name, firstName, lastName, schoolName, birthMonth, birthYear, gradeLevel, gender } = req.body;
+// Registration endpoint.
+//
+// Round 15 hardening additions, all gates run BEFORE we hit the DB:
+//   1. registerLimiter (5/hr/IP) above blocks botnet-style bursts before
+//      this handler runs. Defense layer 1.
+//   2. validator.isEmail still rejects malformed addresses.
+//   3. isDisposableEmail rejects ~50 known temp-mail providers (mailinator,
+//      10minutemail, etc.). Raises the cost of "fresh email per attack".
+//   4. Birth-year sanity check rejects obviously-tampered values (year 0,
+//      year 9999, future years, impossibly-old). COPPA-relevant once the
+//      under-13 parental-consent flow lands; today it just keeps the
+//      study-data analytics clean.
+//   5. Password policy unchanged from before (8+ chars, letter + digit).
+//
+// The check order is deliberate: cheap-fast checks before expensive ones.
+// disposable-email is an in-memory Set lookup; uniqueness check is a DB
+// query; bcrypt.hash is a CPU spinner. Reject early to keep the abuse
+// path cheap on our side too.
+app.post("/register", registerLimiter, async (req, res) => {
+  const { email, password, confirmPassword, name, firstName, lastName, schoolName, birthMonth, birthYear, gradeLevel, gender, heightCm, weightKg, parentalConsentGiven } = req.body;
 
   if (typeof email !== "string" || !validator.isEmail(email)) {
     return res.status(400).json({ field: "email", message: "Invalid email." });
+  }
+
+  // Round 17 #9: parental-consent affirmation is required at /register
+  // for COPPA + Apple kids-app compliance. Reject explicitly so the
+  // client toast can surface a kid-friendly message rather than the
+  // generic "Please double-check your details" fallback. The boolean
+  // is also persisted on the User document along with the timestamp
+  // so the LSU IRB has an audit trail of consent affirmations.
+  if (parentalConsentGiven !== true) {
+    return res.status(400).json({
+      field: "parentalConsentGiven",
+      message: "A parent or guardian needs to help set this up before you can join.",
+    });
+  }
+
+  // Round 15, disposable-email block. Generic "use a real email" message
+  // (do NOT echo back which domain matched the blocklist; that just helps
+  // attackers iterate past the filter).
+  if (isDisposableEmail(email)) {
+    return res.status(400).json({
+      field: "email",
+      message: "Please use your main email so we can keep your account safe.",
+    });
+  }
+
+  // Round 15, birth-year validation. Existing `birthYear` is a String per
+  // the User schema, so coerce to int and bound it. Min 1910 (oldest
+  // plausible living user; covers great-grandparents who might register a
+  // family account). Max = current year - 5 (the youngest a kindergartener
+  // could be; below that is data entry error or test data). Accept missing
+  // (legacy clients) but reject obviously-tampered values.
+  if (birthYear !== undefined && birthYear !== null && birthYear !== "") {
+    const yearNum = parseInt(String(birthYear), 10);
+    const currentYear = new Date().getFullYear();
+    if (
+      !Number.isFinite(yearNum) ||
+      yearNum < 1910 ||
+      yearNum > currentYear - 5
+    ) {
+      return res.status(400).json({
+        field: "birthYear",
+        message: "Please enter a valid birth year.",
+      });
+    }
+  }
+
+  // Round 16 Phase 6 #24: bound the optional anatomy fields. Both are
+  // accepted as missing/null/undefined (legacy clients + opt-out
+  // participants both end up at null). Reject obvious tampering so
+  // research analytics aren't corrupted by Number.MAX or -1 values.
+  let heightVal = null;
+  if (heightCm !== undefined && heightCm !== null && heightCm !== "") {
+    const h = Number(heightCm);
+    if (!Number.isFinite(h) || h < 60 || h > 250) {
+      return res.status(400).json({
+        field: "heightCm",
+        message: "Height looks off, please double-check.",
+      });
+    }
+    heightVal = h;
+  }
+  let weightVal = null;
+  if (weightKg !== undefined && weightKg !== null && weightKg !== "") {
+    const w = Number(weightKg);
+    if (!Number.isFinite(w) || w < 10 || w > 300) {
+      return res.status(400).json({
+        field: "weightKg",
+        message: "Weight looks off, please double-check.",
+      });
+    }
+    weightVal = w;
   }
 
   if (password !== confirmPassword) {
@@ -1080,6 +1444,15 @@ app.post("/register", async (req, res) => {
       birthYear,
       gradeLevel,
       gender,
+      heightCm: heightVal,
+      weightKg: weightVal,
+      // Round 17 #9: persist the parental-consent boolean + the
+      // timestamp at which the kid + parent affirmed it. If the User
+      // schema does not yet declare these fields, Mongoose's strict
+      // mode would silently drop them, so the schema also needs the
+      // matching declaration (added in this same commit).
+      parentalConsentGiven: true,
+      parentalConsentAt: new Date(),
       isVerifiedEmail: true,
       verificationCode: hashedVerificationCode,
     });
@@ -1346,6 +1719,10 @@ app.delete(
         // trumps any retention preference: full account wipe = full
         // economy wipe.
         () => EconomyState.deleteMany({ userId }),
+        // Round 15, daily AI usage counter rows. Apple 5.1.1(v) +
+        // COPPA right-to-delete: usage history is derived data and
+        // must wipe with the account.
+        () => DailyAiUsage.deleteMany({ userId }),
       ];
       for (const run of cascades) {
         try {
@@ -1629,10 +2006,19 @@ const handleSave = async () => {
 };
 
 
-app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, (req, res) => {
+app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, async (req, res) => {
   const validated = validateChatbotPrompt(req.body.prompt);
   if (!validated.ok) {
     return res.status(400).json({ error: validated.error });
+  }
+  // Round 15, daily per-user token cap. Same kid-friendly refusal as
+  // /chat/sessions/:id/messages. Bounds OpenAI cost for this endpoint
+  // even if a kid mass-saves goals to chain feedback calls.
+  const overCap = await isUserOverDailyAiCap(req._id).catch(() => false);
+  if (overCap) {
+    return res.status(429).json({
+      error: "You've used today's coach time! Come back tomorrow for more.",
+    });
   }
   const prompt = validated.prompt;
   try {
@@ -1685,6 +2071,11 @@ app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, ch
     })
     .then((response) => {
       const chat_reply = response.choices[0].message.content;
+      // Round 15, fire-and-forget usage record; do not block the reply.
+      const tokens = (response.usage && response.usage.total_tokens) || 0;
+      recordDailyAiUsageTokens(req._id, tokens).catch((e) =>
+        console.error("DailyAiUsage record error (chatbot):", e && e.message)
+      );
       res.json({ chat_reply });
     })
     // Without this .catch(), an OpenAI rejection (key exhausted, network
@@ -1703,10 +2094,17 @@ app.post("/chatbot", authMiddleware.verifyToken, authMiddleware.attachUserId, ch
   }
 });
 
-app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, (req, res) => {
+app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attachUserId, chatbotLimiter, async (req, res) => {
   const validated = validateChatbotPrompt(req.body.prompt);
   if (!validated.ok) {
     return res.status(400).json({ error: validated.error });
+  }
+  // Round 15, daily per-user token cap (mirror of /chatbot above).
+  const overCap = await isUserOverDailyAiCap(req._id).catch(() => false);
+  if (overCap) {
+    return res.status(429).json({
+      error: "You've used today's coach time! Come back tomorrow for more.",
+    });
   }
   const prompt = validated.prompt;
   try {
@@ -1754,6 +2152,11 @@ app.post("/chatbot/screentime", authMiddleware.verifyToken, authMiddleware.attac
     })
     .then((response) => {
       const chat_reply = response.choices[0].message.content;
+      // Round 15, fire-and-forget usage record (matches /chatbot).
+      const tokens = (response.usage && response.usage.total_tokens) || 0;
+      recordDailyAiUsageTokens(req._id, tokens).catch((e) =>
+        console.error("DailyAiUsage record error (screentime):", e && e.message)
+      );
       res.json({ chat_reply });
     })
     // Same unhandled-rejection guard as /chatbot above, without this,
@@ -1866,6 +2269,20 @@ app.post(
         return res
           .status(403)
           .send("Forbidden: cannot write to another user's session.");
+      }
+
+      // Round 15, daily per-user token cap. Run BEFORE moderation so an
+      // already-over-cap user gets a fast cheap rejection instead of
+      // burning a free moderation API call. Refusal copy is kid-
+      // appropriate (no "you're banned" tone, just "come back tomorrow")
+      // because Apple kids-app review cares about the UX of error
+      // states. The chatLimiter (50/hr) still kicks in upstream; this
+      // is the cost-per-user ceiling, not the rate ceiling.
+      const overCap = await isUserOverDailyAiCap(req._id).catch(() => false);
+      if (overCap) {
+        return res.status(429).json({
+          message: "You've used today's coach time! Come back tomorrow for more.",
+        });
       }
 
       // Phase 13.6, moderate the USER message BEFORE we let it hit
@@ -2086,9 +2503,15 @@ app.post(
       session.expiresAt = expiresAt;
       // First user message also titles the session if it still has the
       // default title, gives the history list something readable without
-      // an extra OpenAI call.
+      // an extra OpenAI call. Round 17: allowlist now covers the new
+      // "Chat with your buddy" default AND the legacy "Chat with Coach
+      // Pebble" so existing-DB sessions still auto-title on first reply.
+      const FIRST_MESSAGE_TITLE_DEFAULTS = [
+        "Chat with your buddy",
+        "Chat with Coach Pebble",
+      ];
       if (
-        session.title === "Chat with Coach Pebble" &&
+        FIRST_MESSAGE_TITLE_DEFAULTS.includes(session.title) &&
         session.messageCount <= 2
       ) {
         const candidate = userText.split(/\s+/).slice(0, 6).join(" ");
@@ -2104,6 +2527,18 @@ app.post(
       console.log(
         `chat msg ok session=${session._id} user=${req._id} tokens=${tokensUsed}`
       );
+
+      // Round 15, record the actual token usage so the next call from
+      // this user can be checked against the daily cap. Best-effort: a
+      // failed write here doesn't bounce the kid out of the conversation
+      // they just had (they already got their reply), it just means the
+      // cap is slightly under-counted for this minute. The aggregate
+      // log line inside this helper also tracks global daily total.
+      try {
+        await recordDailyAiUsageTokens(req._id, tokensUsed);
+      } catch (usageErr) {
+        console.error("DailyAiUsage record error:", usageErr);
+      }
 
       return res.status(200).json({
         userMessage: {
@@ -2271,6 +2706,21 @@ app.get(
           plateBuilderStats: {},
           plateBuilderStreak: 0,
           plateBuilderStreakDate: "",
+          plateBuilderDailyChallengeDate: "",
+          // Round 15, Sleepy Pebble defaults so a fresh client can hydrate
+          // without needing version-aware fallback logic.
+          sleepyPebbleHighScore: 0,
+          sleepyPebbleAchievements: [],
+          sleepyPebbleStats: {},
+          sleepyPebbleStreak: 0,
+          sleepyPebbleStreakDate: "",
+          sleepyPebbleEnvironments: [],
+          sleepyPebbleDailyChallengeDate: "",
+          sleepyPebbleTriviaStats: {},
+          // Round 16 Phase 7 #40 defaults so a fresh client hydrates
+          // without needing version-aware fallback logic.
+          appUseAchievements: [],
+          appUseStats: {},
         };
       } else {
         // Mongoose Map fields serialize as plain objects via .lean(),
@@ -2280,6 +2730,20 @@ app.get(
         doc.lastGoalCoinDate = doc.lastGoalCoinDate || {};
         doc.plateBuilderHighScores = doc.plateBuilderHighScores || {};
         doc.plateBuilderStats = doc.plateBuilderStats || {};
+        doc.sleepyPebbleStats = doc.sleepyPebbleStats || {};
+        doc.sleepyPebbleTriviaStats = doc.sleepyPebbleTriviaStats || {};
+        // Backwards-compat: existing accounts pre-Round-15 don't have these
+        // fields persisted yet. Default them so the client never sees
+        // undefined.
+        if (typeof doc.sleepyPebbleHighScore !== "number") doc.sleepyPebbleHighScore = 0;
+        if (!Array.isArray(doc.sleepyPebbleAchievements)) doc.sleepyPebbleAchievements = [];
+        if (typeof doc.sleepyPebbleStreak !== "number") doc.sleepyPebbleStreak = 0;
+        if (typeof doc.sleepyPebbleStreakDate !== "string") doc.sleepyPebbleStreakDate = "";
+        if (!Array.isArray(doc.sleepyPebbleEnvironments)) doc.sleepyPebbleEnvironments = [];
+        if (typeof doc.sleepyPebbleDailyChallengeDate !== "string") doc.sleepyPebbleDailyChallengeDate = "";
+        // Round 16 Phase 7 #40 backwards-compat: pre-Phase-7 accounts.
+        if (!Array.isArray(doc.appUseAchievements)) doc.appUseAchievements = [];
+        doc.appUseStats = doc.appUseStats || {};
       }
       return res.status(200).json(doc);
     } catch (err) {
@@ -2310,6 +2774,171 @@ app.put(
     } catch (err) {
       console.error("Economy PUT error:", err);
       return res.status(500).json({ message: "Could not save economy state." });
+    }
+  }
+);
+
+// ===========================================================================
+// Round 16 Phase 6 #24, PUT /user/profile, partial update for the
+// optional anatomy fields (heightCm + weightKg). Auth-gated; only the
+// authenticated user's own document is touched (req._id from
+// attachUserId, NOT a body-supplied id, so a token-holder can't bump
+// another kid's record). Bounds match the schema; out-of-range values
+// → 400 with a kid-friendly message. Whitelist-only field set so a
+// client can't sneak email/name/password updates through this surface,
+// those go through their own endpoints with their own validation.
+// ===========================================================================
+app.put(
+  "/user/profile",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  async (req, res) => {
+    try {
+      const { heightCm, weightKg } = req.body || {};
+      const update = {};
+      if (heightCm !== undefined) {
+        if (heightCm === null || heightCm === "") {
+          update.heightCm = null;
+        } else {
+          const h = Number(heightCm);
+          if (!Number.isFinite(h) || h < 60 || h > 250) {
+            return res.status(400).json({
+              field: "heightCm",
+              message: "Height looks off, please double-check.",
+            });
+          }
+          update.heightCm = h;
+        }
+      }
+      if (weightKg !== undefined) {
+        if (weightKg === null || weightKg === "") {
+          update.weightKg = null;
+        } else {
+          const w = Number(weightKg);
+          if (!Number.isFinite(w) || w < 10 || w > 300) {
+            return res.status(400).json({
+              field: "weightKg",
+              message: "Weight looks off, please double-check.",
+            });
+          }
+          update.weightKg = w;
+        }
+      }
+      if (Object.keys(update).length === 0) {
+        return res.status(400).json({ message: "No supported fields supplied." });
+      }
+      const updated = await User.findByIdAndUpdate(
+        req._id,
+        { $set: update },
+        { new: true, runValidators: true }
+      );
+      if (!updated) {
+        return res.status(404).json({ message: "User not found." });
+      }
+      return res.status(200).json({
+        heightCm: updated.heightCm ?? null,
+        weightKg: updated.weightKg ?? null,
+      });
+    } catch (err) {
+      console.error("/user/profile PUT error:", err);
+      return res.status(500).json({ message: "Could not save profile." });
+    }
+  }
+);
+
+// ===========================================================================
+// Round 15, in-app support contact form. Replaces the old mailto: link in
+// settings_screen.dart with a real POST that lands in our SendGrid pipeline.
+// Why move off mailto:
+//   - mailto: depended on a working email client on the user's device
+//     (broken on web, broken when the user uses Gmail web only)
+//   - mailto: gave attackers full control over headers (subject, To, etc.)
+//     if they could phish someone into a crafted URL; in-app form forces
+//     server-controlled headers
+//   - we get one timeline of all support contacts in our SendGrid logs
+//
+// Defense layers:
+//   1. supportLimiter (5/hr/authenticated user) above blocks single-user
+//      spam against the support inbox
+//   2. verifyToken + attachUserId, no anonymous submissions, prevents
+//      botnet floods (attacker would have to first register and pass the
+//      registerLimiter + email verification)
+//   3. Length bounds: subject max 100 chars, message 10-2000 chars
+//   4. Plain-text-only payload to SendGrid (`text:`, NOT `html:`); blocks
+//      HTML injection attacks against the human reading the support email
+//   5. No user-controlled reply-to header. SendGrid `from` is our verified
+//      sender; we surface the user's account email INSIDE the body so a
+//      reply-all goes to the human reading it, NOT to attacker-controlled
+//      address. Closes header-injection / spam-amplification attacks.
+//   6. Subject defaults to "(no subject)" if empty; we always prefix with
+//      "[ProudMe Support]" so the inbox can route on it.
+// ===========================================================================
+app.post(
+  "/support/contact",
+  authMiddleware.verifyToken,
+  authMiddleware.attachUserId,
+  supportLimiter,
+  async (req, res) => {
+    try {
+      const subjectRaw =
+        req.body && typeof req.body.subject === "string" ? req.body.subject : "";
+      const messageRaw =
+        req.body && typeof req.body.message === "string" ? req.body.message : "";
+      const subject = subjectRaw.trim().slice(0, 100);
+      const message = messageRaw.trim();
+      if (message.length < 10 || message.length > 2000) {
+        return res
+          .status(400)
+          .json({ message: "Message must be 10-2000 characters." });
+      }
+
+      // Look up the user's email so the support inbox sees who's asking
+      // without trusting client-supplied "from" data.
+      let userEmail = "(unknown)";
+      try {
+        const user = await User.findById(req._id).select("email");
+        if (user && user.email) userEmail = user.email;
+      } catch (_) {
+        // Best-effort, the message still goes out with "(unknown)".
+      }
+
+      const safeSubject = `[ProudMe Support] ${subject || "(no subject)"}`;
+      // Plain-text body. NEVER inject user content into HTML.
+      const body =
+        `New support message from ProudMe app.\n\n` +
+        `User account email: ${userEmail}\n` +
+        `User id: ${req._id}\n` +
+        `Time (UTC): ${new Date().toISOString()}\n` +
+        `\n` +
+        `--- Message ---\n` +
+        `${message}\n` +
+        `--- End ---\n`;
+
+      const SUPPORT_INBOX =
+        process.env.SUPPORT_INBOX_EMAIL || "bquach1@gmail.com";
+
+      try {
+        await sgMail.send({
+          to: SUPPORT_INBOX,
+          // Verified SendGrid sender (matches verification-email pattern).
+          from: "pklab@projectproudme.com",
+          subject: safeSubject,
+          text: body,
+        });
+      } catch (sendErr) {
+        console.error("Support contact send failed:", sendErr && sendErr.message);
+        return res
+          .status(500)
+          .json({ message: "Couldn't send. Please try again later." });
+      }
+
+      console.log(
+        `support contact ok user=${req._id} subjectLen=${subject.length} msgLen=${message.length}`
+      );
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error("Support contact error:", err);
+      return res.status(500).json({ message: "Couldn't send." });
     }
   }
 );
